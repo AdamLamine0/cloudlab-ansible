@@ -1,0 +1,140 @@
+---
+# ---------------------------------------------------------------------------
+# 1. STATIC IP
+# Same file-swap pattern as nomad_node. IMPORTANT — same lesson learned the
+# hard way on testnomad: this only WRITES the config. It does not take
+# effect until networking is restarted, and the safest way to do that is a
+# manual reboot after this play finishes (see README) — restarting mid-play
+# risks dropping the SSH session Ansible is using.
+# ---------------------------------------------------------------------------
+- name: Back up existing /etc/network/interfaces
+  ansible.builtin.copy:
+    src: /etc/network/interfaces
+    dest: /etc/network/interfaces.bak
+    remote_src: true
+    force: false
+
+- name: Write static IP config
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart networking
+
+# ---------------------------------------------------------------------------
+# 2. DNS
+# The real kube VM has dhcpcd disabled+masked (a leftover from how it was
+# originally built — handoff §2). A fresh netinst test VM likely won't have
+# dhcpcd at all, same as testnomad didn't. Check rather than assume either
+# way, and handle both.
+# ---------------------------------------------------------------------------
+- name: Check whether dhcpcd is installed
+  ansible.builtin.command: dpkg -s dhcpcd5
+  register: dhcpcd_check
+  failed_when: false
+  changed_when: false
+
+- name: Disable and mask dhcpcd if present (matches real kube VM's config)
+  ansible.builtin.systemd:
+    name: dhcpcd
+    enabled: false
+    masked: true
+    state: stopped
+  when: dhcpcd_check.rc == 0
+
+- name: Check whether resolvconf is installed (should be absent, matching prod)
+  ansible.builtin.command: dpkg -s resolvconf
+  register: resolvconf_check
+  failed_when: false
+  changed_when: false
+
+- name: Warn if resolvconf is present
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: resolvconf is installed on this VM. Confirm this matches how
+      the real kube VM was built before trusting this run — see nomad_node's
+      equivalent warning for why this matters.
+  when: resolvconf_check.rc == 0
+
+- name: Unlock /etc/resolv.conf if immutable
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    attributes: "-i"
+  ignore_errors: true
+
+- name: Write /etc/resolv.conf
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Lock /etc/resolv.conf (chattr +i)
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    attributes: "+i"
+
+# ---------------------------------------------------------------------------
+# 3. INSTALL K3S
+# Pinned to the exact version the real cluster runs (handoff §3), not
+# "latest" — an untested newer k3s could behave differently.
+# ---------------------------------------------------------------------------
+- name: Install curl (required by the k3s install script)
+  ansible.builtin.apt:
+    name: curl
+    state: present
+    update_cache: true
+
+- name: Install k3s (pinned version)
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -
+  args:
+    creates: /usr/local/bin/k3s
+
+- name: Wait for the k3s node to report Ready
+  ansible.builtin.command: >
+    kubectl get nodes --no-headers --kubeconfig=/etc/rancher/k3s/k3s.yaml
+  register: k3s_node_status
+  changed_when: false
+  retries: 12
+  delay: 10
+  until: "'Ready' in k3s_node_status.stdout"
+
+# ---------------------------------------------------------------------------
+# 4. COREDNS — add the .consul forward zone (handoff §14)
+# This is the piece that makes *.service.consul resolvable from inside any
+# pod, forwarding straight to Consul's own DNS interface on the nomad-style
+# VM for this environment (consul_dns_target — MUST be set correctly in
+# defaults/main.yml or via -e for whichever nomad box this kube talks to).
+# ---------------------------------------------------------------------------
+- name: Write CoreDNS ConfigMap manifest
+  ansible.builtin.template:
+    src: coredns-configmap.yaml.j2
+    dest: /root/coredns-configmap.yaml
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply CoreDNS ConfigMap (declarative apply, not kubectl edit — see handoff §16 problem #24)
+  ansible.builtin.command: >
+    kubectl apply -f /root/coredns-configmap.yaml
+    --kubeconfig=/etc/rancher/k3s/k3s.yaml
+  register: coredns_apply
+  changed_when: "'configured' in coredns_apply.stdout or 'created' in coredns_apply.stdout"
+  notify: restart coredns
+
+- name: Flush handlers now so CoreDNS actually picks up the new Corefile
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for CoreDNS pod to be ready again after restart
+  ansible.builtin.command: >
+    kubectl get pods -n kube-system -l k8s-app=kube-dns
+    --kubeconfig=/etc/rancher/k3s/k3s.yaml --no-headers
+  register: coredns_pod_status
+  changed_when: false
+  retries: 12
+  delay: 5
+  until: "'Running' in coredns_pod_status.stdout"

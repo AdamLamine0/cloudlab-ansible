@@ -1,0 +1,16 @@
+---
+# Builds a nomad-style VM from a bare Debian 13 install: static IP, locked
+# resolv.conf, HashiCorp apt repo, Nomad + Consul, telemetry config, services
+# enabled and running.
+#
+# SAFETY: this playbook is written against the [nomad_test] group only.
+# Do not point it at [nomad_prod] (the real 192.168.1.51 nomad VM) until a
+# clean run against the disposable test VM has been reviewed and confirmed
+# to match /root/etc/nomad.d/nomad.hcl and /etc/consul.d/consul.hcl on the
+# real box line-for-line.
+
+- name: Build and configure a Nomad + Consul node
+  hosts: nomad_test
+  become: true
+  roles:
+    - nomad_node

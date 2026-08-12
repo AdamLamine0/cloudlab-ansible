@@ -1,0 +1,16 @@
+---
+- name: restart networking
+  ansible.builtin.command: systemctl restart networking
+  listen: "restart networking"
+
+- name: restart consul
+  ansible.builtin.systemd:
+    name: consul
+    state: restarted
+  listen: "restart consul"
+
+- name: restart nomad
+  ansible.builtin.systemd:
+    name: nomad
+    state: restarted
+  listen: "restart nomad"

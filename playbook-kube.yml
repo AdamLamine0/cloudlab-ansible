@@ -1,0 +1,15 @@
+---
+# Builds a kube-style VM from a bare Debian 13 install: static IP, locked
+# resolv.conf, pinned k3s install, CoreDNS .consul forward zone.
+#
+# SAFETY: targets [kube_test] only. Do not point at [kube_prod] (the real
+# 192.168.1.50 kube VM — running live tenant workloads, Dex, Vault, and
+# monitoring) until a clean run against the disposable test VM has been
+# reviewed and diffed against the real box's CoreDNS ConfigMap and
+# /etc/network/interfaces line-for-line.
+
+- name: Build and configure a k3s node
+  hosts: kube_test
+  become: true
+  roles:
+    - kube_node

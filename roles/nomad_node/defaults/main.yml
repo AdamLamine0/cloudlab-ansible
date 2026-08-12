@@ -1,0 +1,18 @@
+---
+# Network identity for this node. Override per-host (host_vars or -e) when
+# eventually pointing this role at the real nomad VM (192.168.1.51).
+node_static_ip: "192.168.1.60"
+node_interface: "ens18"
+node_gateway: "192.168.1.1"
+node_dns_server: "192.168.1.1"
+node_dns_search: "cloudlab.internal"
+
+# Consul
+consul_datacenter: "cloudlab"
+consul_bind_addr: "{{ node_static_ip }}"
+consul_data_dir: "/opt/consul/data"
+
+# Nomad
+nomad_datacenter: "cloudlab"
+nomad_bind_addr: "{{ node_static_ip }}"
+nomad_data_dir: "/opt/nomad/data"

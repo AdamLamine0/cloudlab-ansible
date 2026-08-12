@@ -1,0 +1,175 @@
+---
+# ---------------------------------------------------------------------------
+# 1. STATIC IP
+# Same pattern as the real nomad VM: plain ifupdown, no dhcpcd on this image
+# class, so nothing needs masking — just replace /etc/network/interfaces.
+# ---------------------------------------------------------------------------
+- name: Back up existing /etc/network/interfaces
+  ansible.builtin.copy:
+    src: /etc/network/interfaces
+    dest: /etc/network/interfaces.bak
+    remote_src: true
+    force: false  # don't clobber a .bak from a previous run
+
+- name: Write static IP config
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart networking
+
+# ---------------------------------------------------------------------------
+# 2. DNS
+# Ground truth from this project (handoff §2): resolvconf is not installed
+# on this VM class, so `dns-nameservers` in /etc/network/interfaces is
+# silently ignored. Write /etc/resolv.conf directly and lock it with
+# chattr +i so nothing (DHCP client, resolvconf if later installed by
+# accident, etc.) silently overwrites it.
+# ---------------------------------------------------------------------------
+- name: Check whether resolvconf is installed (should be absent, matching prod)
+  ansible.builtin.command: dpkg -s resolvconf
+  register: resolvconf_check
+  failed_when: false
+  changed_when: false
+
+- name: Warn if resolvconf is present (prod has none — investigate before continuing)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: resolvconf is installed on this VM. The real nomad VM does not
+      have it, and that absence is exactly why /etc/resolv.conf must be
+      written directly instead of relying on dns-nameservers. Confirm this
+      test VM was built the same way as prod before trusting this run.
+  when: resolvconf_check.rc == 0
+
+- name: Unlock /etc/resolv.conf if immutable (so it can be rewritten)
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    attributes: "-i"
+  ignore_errors: true  # file may not exist yet on a fresh VM
+
+- name: Write /etc/resolv.conf
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Lock /etc/resolv.conf (chattr +i)
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    attributes: "+i"
+
+# ---------------------------------------------------------------------------
+# 3. HASHICORP APT REPO + PACKAGES
+# ---------------------------------------------------------------------------
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - gnupg
+      - lsb-release
+      - curl
+    state: present
+    update_cache: true
+
+- name: Fetch HashiCorp GPG key
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /tmp/hashicorp.gpg.asc
+    mode: "0644"
+
+- name: De-armor HashiCorp GPG key into keyring
+  ansible.builtin.command: >
+    gpg --dearmor --batch --yes
+    -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    /tmp/hashicorp.gpg.asc
+  args:
+    creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+- name: Add HashiCorp apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg]
+      https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main
+    filename: hashicorp
+    state: present
+
+- name: Install Nomad and Consul
+  ansible.builtin.apt:
+    name:
+      - nomad
+      - consul
+    state: present
+    update_cache: true
+
+# ---------------------------------------------------------------------------
+# 4. CONFIG
+# ---------------------------------------------------------------------------
+- name: Ensure Consul data directory exists
+  ansible.builtin.file:
+    path: "{{ consul_data_dir }}"
+    state: directory
+    owner: consul
+    group: consul
+    mode: "0750"
+
+- name: Ensure Nomad data directory exists
+  ansible.builtin.file:
+    path: "{{ nomad_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Write Consul config
+  ansible.builtin.template:
+    src: consul.hcl.j2
+    dest: /etc/consul.d/consul.hcl
+    owner: consul
+    group: consul
+    mode: "0640"
+  notify: restart consul
+
+- name: Write Nomad config
+  ansible.builtin.template:
+    src: nomad.hcl.j2
+    dest: /etc/nomad.d/nomad.hcl
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart nomad
+
+# ---------------------------------------------------------------------------
+# 5. SERVICES
+# ---------------------------------------------------------------------------
+- name: Enable and start Consul
+  ansible.builtin.systemd:
+    name: consul
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Enable and start Nomad
+  ansible.builtin.systemd:
+    name: nomad
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Give services a moment to elect/bootstrap
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Verify Consul is leader
+  ansible.builtin.command: consul info
+  register: consul_info
+  changed_when: false
+  failed_when: "'leader = true' not in consul_info.stdout"
+
+- name: Verify Nomad server is up
+  ansible.builtin.command: nomad server members
+  register: nomad_members
+  changed_when: false
+  failed_when: "'alive' not in nomad_members.stdout"

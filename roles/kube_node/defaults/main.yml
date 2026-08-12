@@ -1,0 +1,18 @@
+---
+# Network identity for this node. Override when pointing this role at the
+# real kube VM (192.168.1.50) or a different test box.
+node_static_ip: "192.168.1.70"
+node_interface: "ens18"
+node_gateway: "192.168.1.1"
+node_dns_server: "192.168.1.1"
+node_dns_search: "cloudlab.internal"
+
+# k3s — pinned to match the real cluster exactly (handoff §3), not "latest"
+k3s_version: "v1.36.2+k3s1"
+
+# CoreDNS's second server block forwards *.service.consul lookups straight to
+# Consul's own DNS interface (port 8600) on whichever nomad-style VM this
+# environment's Consul is running on. On the test side that's testnomad
+# (.60); in prod it's the real nomad VM (.51). MUST be overridden per
+# environment — there's no safe default here.
+consul_dns_target: "192.168.1.51:8600"
