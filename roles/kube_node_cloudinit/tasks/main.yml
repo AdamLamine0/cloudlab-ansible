@@ -1,0 +1,53 @@
+---
+# Cloud-init variant of kube_node: no static-IP, dhcpcd, or DNS-lock tasks,
+# since Terraform + cloud-init handle networking before Ansible connects.
+
+- name: Install curl (required by the k3s install script)
+  ansible.builtin.apt:
+    name: curl
+    state: present
+    update_cache: true
+
+- name: Install k3s (pinned version)
+  ansible.builtin.shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -
+  args:
+    creates: /usr/local/bin/k3s
+
+- name: Wait for the k3s node to report Ready
+  ansible.builtin.command: >
+    kubectl get nodes --no-headers --kubeconfig=/etc/rancher/k3s/k3s.yaml
+  register: k3s_node_status
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: "'Ready' in k3s_node_status.stdout"
+
+- name: Write CoreDNS ConfigMap manifest
+  ansible.builtin.template:
+    src: coredns-configmap.yaml.j2
+    dest: /root/coredns-configmap.yaml
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply CoreDNS ConfigMap (declarative apply, not kubectl edit — see handoff §16 problem #24)
+  ansible.builtin.command: >
+    kubectl apply -f /root/coredns-configmap.yaml
+    --kubeconfig=/etc/rancher/k3s/k3s.yaml
+  register: coredns_apply
+  changed_when: "'configured' in coredns_apply.stdout or 'created' in coredns_apply.stdout"
+  notify: restart coredns
+
+- name: Flush handlers now so CoreDNS actually picks up the new Corefile
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for CoreDNS pod to be ready again after restart
+  ansible.builtin.command: >
+    kubectl get pods -n kube-system -l k8s-app=kube-dns
+    --kubeconfig=/etc/rancher/k3s/k3s.yaml --no-headers
+  register: coredns_pod_status
+  changed_when: false
+  retries: 40
+  delay: 10
+  until: "'Running' in coredns_pod_status.stdout"

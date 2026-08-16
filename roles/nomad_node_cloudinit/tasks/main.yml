@@ -1,0 +1,149 @@
+---
+# Cloud-init variant of nomad_node: no static-IP or DNS tasks, since
+# Terraform + cloud-init already handle networking before Ansible ever
+# connects. Everything below this point is identical in spirit to
+# nomad_node's sections 3-5.
+
+# ---------------------------------------------------------------------------
+# HASHICORP APT REPO + PACKAGES
+# ---------------------------------------------------------------------------
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - gnupg
+      - lsb-release
+      - curl
+    state: present
+    update_cache: true
+
+- name: Fetch HashiCorp GPG key
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /tmp/hashicorp.gpg.asc
+    mode: "0644"
+
+- name: De-armor HashiCorp GPG key into keyring
+  ansible.builtin.command: >
+    gpg --dearmor --batch --yes
+    -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    /tmp/hashicorp.gpg.asc
+  args:
+    creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+- name: Add HashiCorp apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg]
+      https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main
+    filename: hashicorp
+    state: present
+
+- name: Install Nomad and Consul
+  ansible.builtin.apt:
+    name:
+      - nomad
+      - consul
+    state: present
+    update_cache: true
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+- name: Ensure Consul data directory exists
+  ansible.builtin.file:
+    path: "{{ consul_data_dir }}"
+    state: directory
+    owner: consul
+    group: consul
+    mode: "0750"
+
+- name: Ensure Nomad data directory exists
+  ansible.builtin.file:
+    path: "{{ nomad_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Write Consul config
+  ansible.builtin.template:
+    src: consul.hcl.j2
+    dest: /etc/consul.d/consul.hcl
+    owner: consul
+    group: consul
+    mode: "0640"
+  notify: restart consul
+
+- name: Write Nomad config
+  ansible.builtin.template:
+    src: nomad.hcl.j2
+    dest: /etc/nomad.d/nomad.hcl
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart nomad
+
+# ---------------------------------------------------------------------------
+# SERVICES
+# ---------------------------------------------------------------------------
+- name: Ensure Consul systemd override directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/consul.service.d
+    state: directory
+    mode: "0755"
+
+- name: Force Consul service Type=exec (notify handshake unreliable on this build)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/consul.service.d/override.conf
+    content: |
+      [Service]
+      Type=exec
+      TimeoutStartSec=300
+    mode: "0644"
+  notify: restart consul
+
+- name: Ensure Nomad systemd override directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/nomad.service.d
+    state: directory
+    mode: "0755"
+
+- name: Force Nomad service Type=exec (notify handshake unreliable on this build)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nomad.service.d/override.conf
+    content: |
+      [Service]
+      Type=exec
+      TimeoutStartSec=300
+    mode: "0644"
+  notify: restart nomad
+
+- name: Enable and start Consul
+  ansible.builtin.systemd:
+    name: consul
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Enable and start Nomad
+  ansible.builtin.systemd:
+    name: nomad
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Give services a moment to elect/bootstrap
+  ansible.builtin.pause:
+    seconds: 5
+
+- name: Verify Consul is leader
+  ansible.builtin.command: consul info
+  register: consul_info
+  changed_when: false
+  failed_when: "'leader = true' not in consul_info.stdout"
+
+- name: Verify Nomad server is up
+  ansible.builtin.command: nomad server members
+  register: nomad_members
+  changed_when: false
+  failed_when: "'alive' not in nomad_members.stdout"

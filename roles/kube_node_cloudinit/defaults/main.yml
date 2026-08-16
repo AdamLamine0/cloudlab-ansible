@@ -1,0 +1,15 @@
+---
+# Network identity — VM 110 already has this IP via cloud-init/Terraform,
+# kept here only for reference/consistency with kube_node's variable names.
+node_static_ip: "{{ ansible_host }}"
+node_interface: "ens18"
+node_gateway: "192.168.1.1"
+node_dns_server: "192.168.1.1"
+node_dns_search: "cloudlab.internal"
+
+# k3s — pinned to match the real cluster exactly (handoff §3), not "latest"
+k3s_version: "v1.36.2+k3s1"
+
+# CoreDNS's second server block forwards *.service.consul lookups to
+# Consul's DNS interface (port 8600) on the real nomad VM.
+consul_dns_target: "192.168.1.81:8600"

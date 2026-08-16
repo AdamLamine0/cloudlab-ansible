@@ -1,0 +1,19 @@
+---
+# Network identity — VM 110 already has this IP via cloud-init/Terraform,
+# this is just used for Consul/Nomad's own bind_addr config.
+node_static_ip: "{{ ansible_host }}"
+node_interface: "ens18"
+node_gateway: "192.168.1.1"
+node_dns_server: "192.168.1.1"
+node_dns_search: "cloudlab.internal"
+
+# Consul
+consul_datacenter: "cloudlab"
+consul_bind_addr: "{{ node_static_ip }}"
+consul_data_dir: "/opt/consul/data"
+
+# Nomad
+nomad_datacenter: "cloudlab"
+nomad_bind_addr: "{{ node_static_ip }}"
+nomad_data_dir: "/opt/nomad/data"
+nomad_enable_raw_exec: true   # v10 problem #64 — folds the manual test-session edit into the role

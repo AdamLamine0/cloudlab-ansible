@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+auto {{ node_interface }}
+iface {{ node_interface }} inet static
+    address {{ node_static_ip }}/24
+    gateway {{ node_gateway }}
+    dns-nameservers {{ node_dns_server }}

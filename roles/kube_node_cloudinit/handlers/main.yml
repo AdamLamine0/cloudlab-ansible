@@ -1,0 +1,6 @@
+---
+- name: restart coredns
+  ansible.builtin.command: >
+    kubectl rollout restart deployment coredns -n kube-system
+    --kubeconfig=/etc/rancher/k3s/k3s.yaml
+  listen: "restart coredns"

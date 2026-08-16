@@ -1,0 +1,10 @@
+---
+# Cloud-init variant of playbook-nomad.yml — targets a Terraform-created VM
+# (nomad_terraform group) using nomad_node_cloudinit, which skips the
+# static-IP/DNS tasks since cloud-init already handled networking.
+
+- name: Build and configure a Nomad + Consul node (Terraform/cloud-init VM)
+  hosts: nomad_terraform
+  become: true
+  roles:
+    - nomad_node_cloudinit

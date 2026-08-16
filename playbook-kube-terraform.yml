@@ -1,0 +1,9 @@
+---
+# Cloud-init variant of playbook-kube.yml — targets a Terraform-created VM
+# (kube_terraform group) using kube_node_cloudinit.
+
+- name: Build and configure a kube node (Terraform/cloud-init VM)
+  hosts: kube_terraform
+  become: true
+  roles:
+    - kube_node_cloudinit
