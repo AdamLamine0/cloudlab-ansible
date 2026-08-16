@@ -28,6 +28,19 @@ resource "proxmox_virtual_environment_vm" "cloudlab_vm" {
     full  = true
   }
 
+  lifecycle {
+    ignore_changes = [clone]
+  }
+
+  serial_device {
+    device = "socket"
+  }
+
+  vga {
+    type = "serial0"
+    memory = 16
+  }
+
   disk {
     datastore_id = "local-lvm"
     interface    = "scsi0"
