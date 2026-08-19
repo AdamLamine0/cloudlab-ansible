@@ -1,0 +1,10 @@
+# --- New file: roles/nomad_node/templates/nomad-tenant-policy.hcl.j2 ---
+# Rendered once per tenant in nomad_tenants (defaults/main.yml).
+# Nomad ACL rule syntax - scopes this token to ONLY the matching
+# namespace. No explicit deny needed for other namespaces - a Nomad ACL
+# token with no rule for a given namespace is denied there by default,
+# same principle as Consul's default_policy = "deny".
+
+namespace "{{ item.name }}" {
+  policy = "write"
+}

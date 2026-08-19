@@ -9,11 +9,25 @@ server {
 
 client {
   enabled = true
+{% if nomad_enable_raw_exec %}
+  options = {
+    "driver.raw_exec.enable" = "1"
+  }
+{% endif %}
 }
 
 consul {
   address = "127.0.0.1:8500"
+{% if consul_nomad_integration_token is defined %}
+  token = "{{ consul_nomad_integration_token }}"
+{% endif %}
 }
+
+{% if nomad_acl_enabled %}
+acl {
+  enabled = true
+}
+{% endif %}
 
 addresses { http = "0.0.0.0" }
 

@@ -10,3 +10,10 @@ telemetry {
   prometheus_retention_time = "24h"
   disable_hostname = true
 }
+{% if consul_acl_enabled %}
+acl {
+  enabled        = true
+  default_policy = "{{ consul_acl_default_policy }}"
+  enable_token_persistence = true
+}
+{% endif %}

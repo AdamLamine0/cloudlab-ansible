@@ -1,0 +1,16 @@
+# --- New file: roles/nomad_node/templates/consul-tenant-policy.hcl.j2 ---
+# Rendered once per tenant in consul_tenants (defaults/main.yml).
+
+service_prefix "{{ item.service_prefix }}" {
+  policy = "write"
+}
+
+# Read-only catalog visibility, needed for DNS resolution (the cross-node
+# discovery proven in v10, §22) without granting write on other tenants.
+node_prefix "" {
+  policy = "read"
+}
+
+# default_policy = "deny" in consul.hcl.j2 already denies everything else -
+# no explicit deny stanza needed. Don't add a broad allow rule here without
+# re-reading §18 first.

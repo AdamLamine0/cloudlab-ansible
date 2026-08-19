@@ -1,0 +1,16 @@
+# --- New file: roles/nomad_node/templates/consul-prometheus-policy.hcl.j2 ---
+# Read-only. Covers /v1/agent/metrics (the endpoint Prometheus scrapes,
+# per your existing telemetry { prometheus_retention_time } config) plus
+# enough catalog read to resolve service names in dashboards.
+
+agent_prefix "" {
+  policy = "read"
+}
+
+node_prefix "" {
+  policy = "read"
+}
+
+service_prefix "" {
+  policy = "read"
+}

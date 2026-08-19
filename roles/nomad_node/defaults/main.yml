@@ -16,3 +16,34 @@ consul_data_dir: "/opt/consul/data"
 nomad_datacenter: "cloudlab"
 nomad_bind_addr: "{{ node_static_ip }}"
 nomad_data_dir: "/opt/nomad/data"
+# Consul ACLs (tenant isolation, wave 1)
+consul_acl_enabled: true
+consul_acl_default_policy: "deny"
+consul_tenants:
+  - name: user1
+    service_prefix: "user1-"
+  - name: user2
+    service_prefix: "user2-"
+consul_acl_vault_env: "acl-test"
+consul_acl_vault_path: "cloudlab/consul/{{ consul_acl_vault_env }}"
+consul_acl_vault_delegate_host: "kube"
+
+# --- Add to roles/nomad_node/defaults/main.yml ---
+# Nomad has its OWN separate ACL system - different bootstrap, different
+# token, different HCL syntax - from Consul's (already live). Same
+# irreversible-bootstrap rules apply here too.
+
+nomad_acl_enabled: true
+
+nomad_tenants:
+  - name: user1
+  - name: user2
+
+nomad_acl_vault_env: "acl-test"
+nomad_acl_vault_path: "cloudlab/nomad/{{ nomad_acl_vault_env }}"
+nomad_acl_vault_delegate_host: "kube"
+
+# Enables the raw_exec driver on this Nomad client - needed for the
+# namespace-isolation proof job (and any other raw_exec-based jobs).
+# Off by default; same pattern as nomad_node_cloudinit's equivalent toggle.
+nomad_enable_raw_exec: true

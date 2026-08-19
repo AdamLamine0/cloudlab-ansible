@@ -1,0 +1,22 @@
+---
+# Real production nomad-consul VM (VMID 103). Overrides the role's default
+# node_static_ip (192.168.1.60, meant for the disposable test VM) so the
+# static-IP task writes .51's OWN address back to itself instead of
+# accidentally moving it to .60's IP. Confirmed against .51's live
+# /etc/network/interfaces on 2026-08-17: same interface/gateway/DNS as the
+# test VM, only the IP itself differs.
+node_static_ip: "192.168.1.51"
+node_interface: "ens18"
+node_gateway: "192.168.1.1"
+node_dns_server: "192.168.1.1"
+
+# Point Vault storage at the REAL acl path, not acl-test.
+consul_acl_vault_env: "acl"
+
+# Nomad ACLs - real production path, not acl-test
+nomad_acl_vault_env: "acl"
+
+# Deliberately OFF on production - only needed for the .60 isolation test
+# job, no current production job needs it. Enable per-host later if a
+# real workload genuinely requires it.
+nomad_enable_raw_exec: false

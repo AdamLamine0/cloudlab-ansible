@@ -10,7 +10,7 @@
 # real box line-for-line.
 
 - name: Build and configure a Nomad + Consul node
-  hosts: nomad_test
+  hosts: nomad_prod
   become: true
   roles:
     - nomad_node

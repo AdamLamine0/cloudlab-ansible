@@ -141,9 +141,32 @@
     mode: "0640"
   notify: restart nomad
 
+- name: Apply new Consul/Nomad config immediately (don't wait for end-of-play handlers)
+  ansible.builtin.meta: flush_handlers
+
 # ---------------------------------------------------------------------------
 # 5. SERVICES
 # ---------------------------------------------------------------------------
+- name: Consul | systemd drop-in dir for override
+  ansible.builtin.file:
+    path: /etc/systemd/system/consul.service.d
+    state: directory
+    mode: "0755"
+
+- name: Consul | override Type=notify (this build doesn't emit the readiness signal, so notify always times out even though Consul is healthy)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/consul.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Service]
+      Type=exec
+      TimeoutStartSec=60
+  notify: restart consul
+
+- name: Consul | reload systemd so the drop-in takes effect before start
+  ansible.builtin.systemd:
+    daemon_reload: true
+
 - name: Enable and start Consul
   ansible.builtin.systemd:
     name: consul
@@ -166,10 +189,513 @@
   ansible.builtin.command: consul info
   register: consul_info
   changed_when: false
-  failed_when: "'leader = true' not in consul_info.stdout"
+  failed_when: 
+    - "'leader = true' not in consul_info.stdout"
+    - "'Permission denied' not in consul_info.stderr"
 
 - name: Verify Nomad server is up
   ansible.builtin.command: nomad server members
   register: nomad_members
   changed_when: false
-  failed_when: "'alive' not in nomad_members.stdout"
+  failed_when:
+    - "'alive' not in nomad_members.stdout"
+    - "'Permission denied' not in nomad_members.stderr"
+
+# --- Add to roles/nomad_node/tasks/main.yml, AFTER the existing final task
+# "Verify Nomad server is up" (i.e. at the very end of the file) ---
+#
+# WAVE 1 SCOPE: tenant tokens only (user1/user2). No Prometheus token, no
+# Nomad-integration token - those are wave 2, added only after this proves
+# clean end-to-end on nomad_test (.60).
+#
+# Vault has NO reachable address from this VM (confirmed: vault's k8s
+# Service is ClusterIP-only, 10.43.38.35, invisible outside the k3s pod
+# network). So every Vault read/write below is delegate_to the kube host,
+# using the exact same `kubectl exec -n vault vault-0 -- vault ...` pattern
+# your dex-bind setup already uses in production - not a new mechanism,
+# just applying the one you already trust to a new secret.
+#
+# Consul ACL bootstrap is a ONE-TIME, irreversible action per Consul
+# cluster. This block checks Vault first and fails LOUDLY instead of
+# silently re-bootstrapping or silently overwriting a stored token -
+# same "success != intended value" discipline as problems #19/#42/#62.
+
+- name: Consul ACL | check whether a bootstrap token is already in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/bootstrap
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_acl_existing
+  ignore_errors: true          # non-zero = path not found, expected on first run
+  changed_when: false
+  when: consul_acl_enabled
+
+- name: Consul ACL | bootstrap (first run only)
+  ansible.builtin.command:
+    cmd: consul acl bootstrap -format=json
+  register: consul_acl_bootstrap_result
+  when:
+    - consul_acl_enabled
+    - consul_acl_existing is failed
+  changed_when: true
+
+- name: Consul ACL | FAIL LOUDLY if bootstrap ran but Vault already had a token
+  ansible.builtin.fail:
+    msg: >
+      Consul ACL bootstrap just produced a NEW token but Vault already had
+      one stored under {{ consul_acl_vault_path }}/bootstrap. The old token
+      is now orphaned/invalid. STOP - do not let this task overwrite Vault.
+      See the recovery runbook before doing anything else.
+  when:
+    - consul_acl_bootstrap_result is defined
+    - consul_acl_bootstrap_result is changed
+    - consul_acl_existing is succeeded
+
+- name: Consul ACL | store fresh bootstrap token in Vault (first run only)
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ consul_acl_vault_path }}/bootstrap
+    token={{ (consul_acl_bootstrap_result.stdout | from_json).SecretID }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when:
+    - consul_acl_bootstrap_result is defined
+    - consul_acl_bootstrap_result is changed
+  no_log: true   # the command line itself contains the raw token - never log it
+
+- name: Consul ACL | fetch bootstrap token from Vault (every run)
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/bootstrap
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_acl_token_lookup
+  changed_when: false
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL | set fact for use below
+  ansible.builtin.set_fact:
+    consul_bootstrap_token: "{{ consul_acl_token_lookup.stdout }}"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL | ensure separate policy-files directory exists (NOT /etc/consul.d, which Consul parses as agent config)
+  ansible.builtin.file:
+    path: /etc/consul-acl-policies
+    state: directory
+    mode: "0750"
+  when: consul_acl_enabled
+
+- name: Consul ACL | write per-tenant policy files
+  ansible.builtin.template:
+    src: consul-tenant-policy.hcl.j2
+    dest: "/etc/consul-acl-policies/policy-{{ item.name }}.hcl"
+    mode: "0640"
+  loop: "{{ consul_tenants }}"
+  when: consul_acl_enabled
+
+- name: Consul ACL | create/update tenant policies
+  ansible.builtin.command: >
+    consul acl policy create
+    -name="{{ item.name }}-services"
+    -rules=@/etc/consul-acl-policies/policy-{{ item.name }}.hcl
+    -token="{{ consul_bootstrap_token }}"
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  loop: "{{ consul_tenants }}"
+  register: consul_policy_create
+  failed_when:
+    - consul_policy_create.rc != 0
+    - "'already exists' not in consul_policy_create.stderr"
+  changed_when: "'already exists' not in consul_policy_create.stderr"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL | check if tenant token already exists in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/{{ item.name }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_tenant_token_existing
+  ignore_errors: true
+  changed_when: false
+  no_log: true
+  loop: "{{ consul_tenants }}"
+  when: consul_acl_enabled
+
+- name: Consul ACL | create tenant token (only if not already in Vault)
+  ansible.builtin.command: >
+    consul acl token create
+    -description="{{ item.item.name }} tenant token"
+    -policy-name="{{ item.item.name }}-services"
+    -format=json
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_tenant_token_create
+  loop: "{{ consul_tenant_token_existing.results }}"
+  when:
+    - consul_acl_enabled
+    - item is failed
+  changed_when: true
+  no_log: true
+
+- name: Consul ACL | store new tenant tokens in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ consul_acl_vault_path }}/{{ item.item.item.name }}
+    token={{ (item.stdout | from_json).SecretID }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  loop: "{{ consul_tenant_token_create.results }}"
+  when:
+    - consul_acl_enabled
+    - item is defined
+    - item is changed
+  no_log: true
+
+# --- Add to roles/nomad_node/tasks/main.yml, AFTER the existing final task
+# "Consul ACL | store new tenant tokens in Vault" (i.e. at the very end of
+# the file, after all of wave 1) ---
+#
+# WAVE 2: Prometheus scrape token + Nomad's own Consul-integration token.
+# Same pattern as wave 1 - idempotent, Vault via delegate_to kube, no_log on
+# anything token-shaped.
+
+- name: Consul ACL (wave 2) | write Prometheus policy file
+  ansible.builtin.template:
+    src: consul-prometheus-policy.hcl.j2
+    dest: "/etc/consul-acl-policies/policy-prometheus.hcl"
+    mode: "0640"
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | write Nomad-integration policy file
+  ansible.builtin.template:
+    src: consul-nomad-integration-policy.hcl.j2
+    dest: "/etc/consul-acl-policies/policy-nomad-integration.hcl"
+    mode: "0640"
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | create/update Prometheus policy
+  ansible.builtin.command: >
+    consul acl policy create
+    -name="prometheus-scrape"
+    -rules=@/etc/consul-acl-policies/policy-prometheus.hcl
+    -token="{{ consul_bootstrap_token }}"
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_prometheus_policy_create
+  failed_when:
+    - consul_prometheus_policy_create.rc != 0
+    - "'already exists' not in consul_prometheus_policy_create.stderr"
+  changed_when: "'already exists' not in consul_prometheus_policy_create.stderr"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | create/update Nomad-integration policy
+  ansible.builtin.command: >
+    consul acl policy create
+    -name="nomad-integration"
+    -rules=@/etc/consul-acl-policies/policy-nomad-integration.hcl
+    -token="{{ consul_bootstrap_token }}"
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_nomad_policy_create
+  failed_when:
+    - consul_nomad_policy_create.rc != 0
+    - "'already exists' not in consul_nomad_policy_create.stderr"
+  changed_when: "'already exists' not in consul_nomad_policy_create.stderr"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | check if Prometheus token already exists in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/prometheus
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_prometheus_token_existing
+  ignore_errors: true
+  changed_when: false
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | check if Nomad-integration token already exists in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/nomad-integration
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_nomad_token_existing
+  ignore_errors: true
+  changed_when: false
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | create Prometheus token (only if not already in Vault)
+  ansible.builtin.command: >
+    consul acl token create
+    -description="Prometheus scrape token"
+    -policy-name="prometheus-scrape"
+    -format=json
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_prometheus_token_create
+  when:
+    - consul_acl_enabled
+    - consul_prometheus_token_existing is failed
+  changed_when: true
+  no_log: true
+
+- name: Consul ACL (wave 2) | create Nomad-integration token (only if not already in Vault)
+  ansible.builtin.command: >
+    consul acl token create
+    -description="Nomad Consul-integration token"
+    -policy-name="nomad-integration"
+    -format=json
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_nomad_token_create
+  when:
+    - consul_acl_enabled
+    - consul_nomad_token_existing is failed
+  changed_when: true
+  no_log: true
+
+- name: Consul ACL (wave 2) | store new Prometheus token in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ consul_acl_vault_path }}/prometheus
+    token={{ (consul_prometheus_token_create.stdout | from_json).SecretID }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when:
+    - consul_acl_enabled
+    - consul_prometheus_token_create is defined
+    - consul_prometheus_token_create is changed
+  no_log: true
+
+- name: Consul ACL (wave 2) | store new Nomad-integration token in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ consul_acl_vault_path }}/nomad-integration
+    token={{ (consul_nomad_token_create.stdout | from_json).SecretID }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when:
+    - consul_acl_enabled
+    - consul_nomad_token_create is defined
+    - consul_nomad_token_create is changed
+  no_log: true
+
+- name: Consul ACL (wave 2) | fetch Nomad-integration token from Vault (every run)
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/nomad-integration
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_nomad_integration_token_lookup
+  changed_when: false
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | set fact for Nomad's own Consul token
+  ansible.builtin.set_fact:
+    consul_nomad_integration_token: "{{ consul_nomad_integration_token_lookup.stdout }}"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 2) | re-template Nomad config now that its Consul token exists
+  ansible.builtin.template:
+    src: nomad.hcl.j2
+    dest: /etc/nomad.d/nomad.hcl
+    owner: root
+    group: root
+    mode: "0640"
+  when: consul_acl_enabled
+  notify: restart nomad
+
+- name: Consul ACL (wave 2) | apply Nomad restart immediately
+  ansible.builtin.meta: flush_handlers
+
+- name: Nomad ACL | give Nomad a moment to come back up after the restart above
+  ansible.builtin.pause:
+    seconds: 5
+
+# --- Add to roles/nomad_node/tasks/main.yml, AFTER the existing final
+# task (end of the Consul wave 2 block). ---
+#
+# NOMAD ACL WAVE 1: namespaces + tenant tokens. Separate system from
+# Consul's ACLs (already live) - separate bootstrap, separate one-time
+# irreversible moment, separate token storage path in Vault.
+#
+# Nomad's ACL bootstrap requires the nomad CLI talking to the LOCAL
+# agent - same as Consul, no delegate_to needed for the bootstrap/policy/
+# token/namespace commands themselves, only for the Vault storage steps.
+
+- name: Nomad ACL | check whether a management token is already in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ nomad_acl_vault_path }}/bootstrap
+  delegate_to: "{{ nomad_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: nomad_acl_existing
+  ignore_errors: true
+  changed_when: false
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | bootstrap (first run only)
+  ansible.builtin.command:
+    cmd: nomad acl bootstrap -json
+  register: nomad_acl_bootstrap_result
+  when:
+    - nomad_acl_enabled
+    - nomad_acl_existing is failed
+  changed_when: true
+
+- name: Nomad ACL | FAIL LOUDLY if bootstrap ran but Vault already had a token
+  ansible.builtin.fail:
+    msg: >
+      Nomad ACL bootstrap just produced a NEW management token but Vault
+      already had one stored under {{ nomad_acl_vault_path }}/bootstrap.
+      The old token is now orphaned/invalid. STOP - do not let this task
+      overwrite Vault. Same recovery discipline as the Consul bootstrap
+      recovery runbook applies here (Nomad ALSO has a one-time-only
+      bootstrap - check `nomad acl bootstrap` docs for its own reset
+      mechanism if this happens on real .51).
+  when:
+    - nomad_acl_bootstrap_result is defined
+    - nomad_acl_bootstrap_result is changed
+    - nomad_acl_existing is succeeded
+
+- name: Nomad ACL | store fresh management token in Vault (first run only)
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ nomad_acl_vault_path }}/bootstrap
+    token={{ (nomad_acl_bootstrap_result.stdout | from_json).SecretID }}
+  delegate_to: "{{ nomad_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when:
+    - nomad_acl_bootstrap_result is defined
+    - nomad_acl_bootstrap_result is changed
+  no_log: true
+
+- name: Nomad ACL | fetch management token from Vault (every run)
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ nomad_acl_vault_path }}/bootstrap
+  delegate_to: "{{ nomad_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: nomad_acl_token_lookup
+  changed_when: false
+  no_log: true
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | set fact for use below
+  ansible.builtin.set_fact:
+    nomad_management_token: "{{ nomad_acl_token_lookup.stdout }}"
+  no_log: true
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | create/update tenant namespaces
+  ansible.builtin.command: >
+    nomad namespace apply
+    -description="{{ item.name }} tenant namespace"
+    {{ item.name }}
+  environment:
+    NOMAD_TOKEN: "{{ nomad_management_token }}"
+  loop: "{{ nomad_tenants }}"
+  register: nomad_namespace_apply
+  changed_when: true
+  no_log: true
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | ensure separate policy-files directory exists
+  ansible.builtin.file:
+    path: /etc/nomad-acl-policies
+    state: directory
+    mode: "0750"
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | write per-tenant policy files
+  ansible.builtin.template:
+    src: nomad-tenant-policy.hcl.j2
+    dest: "/etc/nomad-acl-policies/policy-{{ item.name }}.hcl"
+    mode: "0640"
+  loop: "{{ nomad_tenants }}"
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | create/update tenant policies
+  ansible.builtin.command: >
+    nomad acl policy apply
+    -description="{{ item.name }} namespace-scoped policy"
+    {{ item.name }}-namespace
+    /etc/nomad-acl-policies/policy-{{ item.name }}.hcl
+  environment:
+    NOMAD_TOKEN: "{{ nomad_management_token }}"
+  loop: "{{ nomad_tenants }}"
+  register: nomad_policy_apply
+  changed_when: true
+  no_log: true
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | check if tenant token already exists in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ nomad_acl_vault_path }}/{{ item.name }}
+  delegate_to: "{{ nomad_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: nomad_tenant_token_existing
+  ignore_errors: true
+  changed_when: false
+  no_log: true
+  loop: "{{ nomad_tenants }}"
+  when: nomad_acl_enabled
+
+- name: Nomad ACL | create tenant token (only if not already in Vault)
+  ansible.builtin.command: >
+    nomad acl token create
+    -name="{{ item.item.name }} tenant token"
+    -policy="{{ item.item.name }}-namespace"
+    -type=client
+    -json
+  environment:
+    NOMAD_TOKEN: "{{ nomad_management_token }}"
+  register: nomad_tenant_token_create
+  loop: "{{ nomad_tenant_token_existing.results }}"
+  when:
+    - nomad_acl_enabled
+    - item is failed
+  changed_when: true
+  no_log: true
+
+- name: Nomad ACL | store new tenant tokens in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ nomad_acl_vault_path }}/{{ item.item.item.name }}
+    token={{ (item.stdout | from_json).SecretID }}
+  delegate_to: "{{ nomad_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  loop: "{{ nomad_tenant_token_create.results }}"
+  when:
+    - nomad_acl_enabled
+    - item is defined
+    - item is changed
+  no_log: true

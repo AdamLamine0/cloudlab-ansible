@@ -1,0 +1,19 @@
+# --- New file: roles/nomad_node/templates/consul-nomad-integration-policy.hcl.j2 ---
+# Nomad's own token for its native Consul integration (service registration
+# for jobs across ALL tenants, health checks, etc.). Broad by design - see
+# handoff discussion: Nomad is trusted platform infrastructure, not a
+# tenant. The isolation boundary is enforced at the USER token level
+# (proven in wave 1), not by also fencing in the orchestrator that serves
+# every tenant.
+
+service_prefix "" {
+  policy = "write"
+}
+
+agent_prefix "" {
+  policy = "read"
+}
+
+node_prefix "" {
+  policy = "read"
+}
