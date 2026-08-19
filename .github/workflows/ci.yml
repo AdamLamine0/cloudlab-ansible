@@ -120,7 +120,7 @@ jobs:
       - name: Security scan (Checkov — Terraform + Kubernetes)
         run: |
           set -euo pipefail
-          pip install --break-system-packages -q checkov
+          pip install -q checkov --break-system-packages 2>/dev/null || pip install -q checkov
           mkdir -p /tmp/ckv-render
           for tenant in user1 user2; do
             ./hybrid-app/scripts/render-portal.sh "$tenant" > "/tmp/ckv-render/portal-$tenant.yaml"
