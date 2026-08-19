@@ -1,0 +1,36 @@
+---
+# playbook-hybrid-app.yml
+#
+#   ansible-playbook -i inventory.ini playbook-hybrid-app.yml \
+#     --vault-password-file ~/.ansible/vault-pass
+#
+#   # one tenant only:
+#   ansible-playbook -i inventory.ini playbook-hybrid-app.yml \
+#     -e 'hybrid_app_tenants=["user1"]' --vault-password-file ~/.ansible/vault-pass
+#
+# Unlike playbook-nomad.yml, the `hosts:` line here is NOT flipped by
+# hand between test and prod — it always runs on localhost and reaches
+# the real VMs through delegate_to using the kube_prod / nomad_prod
+# groups. That removes the near-miss described in Part 12 ("almost ran
+# against production") from this pipeline entirely, which matters more
+# once a machine is running it unattended.
+
+- name: Deploy the CloudLab hybrid app
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    hybrid_app_tenants:
+      - user1
+      - user2
+
+  tasks:
+    - name: Deploy for each tenant
+      ansible.builtin.include_role:
+        name: hybrid_app
+      vars:
+        tenant: "{{ item }}"
+      loop: "{{ hybrid_app_tenants }}"
+      loop_control:
+        label: "{{ item }}"

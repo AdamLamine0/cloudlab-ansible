@@ -1,0 +1,114 @@
+---
+# .github/workflows/ci.yml
+#
+# Runs on EVERY push, on every branch. Touches nothing in the lab — it
+# only reads the repo. Safe to let run unattended, which is the whole
+# point of separating it from the deploy workflow.
+name: validate
+
+on:
+  push:
+  workflow_dispatch:
+
+# A second push while the first is still running cancels the first.
+# There is one runner and one operator; queueing stale validations
+# behind newer ones wastes the only executor there is.
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: [self-hosted, cloudlab]
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Shell scripts parse
+        run: |
+          set -euo pipefail
+          find . -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
+          echo "all shell scripts parse"
+
+      - name: YAML parses
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for path in sorted(pathlib.Path(".").rglob("*.y*ml")):
+              if ".git" in path.parts:
+                  continue
+              try:
+                  list(yaml.safe_load_all(path.read_text()))
+              except Exception as exc:
+                  bad.append("%s: %s" % (path, exc))
+          for line in bad:
+              print("INVALID", line)
+          sys.exit(1 if bad else 0)
+          PY
+
+      # The portal manifest is templated, so it is only valid YAML once
+      # rendered. Both tenants are rendered and the embedded Python is
+      # compiled — a syntax error in the ConfigMap would otherwise only
+      # surface as a CrashLoopBackOff after deploy.
+      - name: Rendered portal manifests are valid
+        run: |
+          set -euo pipefail
+          for tenant in user1 user2; do
+            ./hybrid-app/scripts/render-portal.sh "$tenant" > "/tmp/portal-$tenant.yaml"
+            python3 - "$tenant" <<'PY'
+          import py_compile, sys, tempfile, yaml
+          tenant = sys.argv[1]
+          docs = [d for d in yaml.safe_load_all(open("/tmp/portal-%s.yaml" % tenant)) if d]
+          kinds = {d["kind"] for d in docs}
+          assert kinds == {"ConfigMap", "Deployment", "Service", "Ingress"}, kinds
+          assert all(d["metadata"]["namespace"] == tenant for d in docs), "wrong namespace"
+          code = [d for d in docs if d["kind"] == "ConfigMap"][0]["data"]["portal.py"]
+          with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+              fh.write(code)
+          py_compile.compile(fh.name, doraise=True)
+          left = [w for w in ("__TENANT__", "__PROBE_PORT__", "__OTHER_TENANT__") if w in open("/tmp/portal-%s.yaml" % tenant).read()]
+          assert not left, "unrendered placeholders: %s" % left
+          print("%s: %d manifests, portal.py compiles" % (tenant, len(docs)))
+          PY
+          done
+
+      - name: Ansible syntax check
+        run: |
+          set -euo pipefail
+          for pb in playbook-*.yml; do
+            ansible-playbook -i inventory.ini "$pb" --syntax-check \
+              --vault-password-file "$ANSIBLE_VAULT_PASSWORD_FILE"
+          done
+        env:
+          # Set on the runner host, not in GitHub. See README §3.
+          ANSIBLE_VAULT_PASSWORD_FILE: /home/auto/.ansible/vault-pass
+
+      - name: Terraform is formatted and valid
+        run: |
+          set -euo pipefail
+          cd terraform
+          terraform fmt -check -recursive
+          terraform validate
+
+      - name: Nomad jobspec is valid
+        run: |
+          set -euo pipefail
+          if ! command -v nomad >/dev/null; then
+            echo "nomad CLI not installed on the runner — skipping"
+            exit 0
+          fi
+          nomad job validate -var=tenant=user1 -var=port=28001 \
+            hybrid-app/nomad/probe.nomad.hcl
+
+      # Guard against the Part 12 near-miss: an infra playbook left
+      # pointed at prod. CI does not run those playbooks, but a push
+      # that flips one to prod should be visible in the log rather than
+      # discovered later at a terminal.
+      - name: Report infra playbook targets
+        run: |
+          set -euo pipefail
+          grep -H 'hosts:' ansible/playbook-nomad.yml ansible/playbook-kube.yml || true

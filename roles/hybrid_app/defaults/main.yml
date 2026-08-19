@@ -1,0 +1,27 @@
+---
+# roles/hybrid_app/defaults/main.yml
+
+# Static ports, one per tenant. See hybrid-app/README.md §7 for why this
+# is static rather than an SRV lookup.
+hybrid_app_tenant_ports:
+  user1: 28001
+  user2: 28002
+
+# Where the repo's hybrid-app/ directory lives on the control node.
+# The CI workflow overrides this with the checkout path.
+hybrid_app_src_dir: "{{ playbook_dir }}/hybrid-app"
+
+# Where artefacts are staged on the target VMs.
+hybrid_app_remote_dir: /opt/cloudlab/hybrid-app
+
+hybrid_app_nomad_addr: "http://192.168.1.51:4646"
+
+# Vault paths. VERIFY THESE against the live Vault before the first run —
+# the handoff records the KV mount as `cloudlab/` and the prefixes as
+# cloudlab/nomad/... and cloudlab/consul/..., but the exact per-tenant
+# key and field names were never captured on screen (they were hidden by
+# no_log during the ACL rollout).
+hybrid_app_vault_nomad_path: "cloudlab/nomad"
+hybrid_app_vault_nomad_field: "token"
+hybrid_app_vault_consul_path: "cloudlab/consul"
+hybrid_app_vault_consul_field: "token"

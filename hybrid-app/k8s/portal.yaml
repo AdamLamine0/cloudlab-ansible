@@ -1,0 +1,432 @@
+# portal — the Kubernetes half of the CloudLab hybrid app.
+#
+# The tenant/port placeholders below are substituted by
+# scripts/render-portal.sh. Do not apply this file directly.
+#
+# WHY THIS RUNS ON KUBERNETES AND NOT ON NOMAD:
+# it is a long-lived HTTP service that needs an Ingress, a per-tenant
+# namespace with a ResourceQuota, and RBAC-scoped access for the tenant
+# — all of which already exist on k3s (Parts 3 and 8) and none of which
+# exist on the Nomad side. It reaches the Nomad half only through
+# Consul, over the *.service.consul path proven in Part 10.
+#
+# The app image is stock python:3.12-alpine and the code is mounted from
+# a ConfigMap. No registry, no build step — deliberately, so that the
+# CI/CD phase has something real to replace rather than something real
+# to invent.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portal-code
+  namespace: __TENANT__
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: hybrid-app
+    cloudlab.tenant: __TENANT__
+data:
+  portal.py: |
+    #!/usr/bin/env python3
+    """portal — tenant dashboard for the CloudLab hybrid app.
+
+    Three things happen here, all of them load-bearing:
+
+      1. DNS      resolve <tenant>-hostprobe.service.consul through
+                  CoreDNS's consul:53 forward zone (Part 3) to Consul's
+                  DNS interface on .51:8600.
+      2. CALL     fetch that host's JSON over plain HTTP — a pod on .50
+                  reading facts about a machine k3s does not manage.
+      3. ISOLATE  query the Consul HTTP API with THIS tenant's token for
+                  its own service (expect 200) and for the other
+                  tenant's (expect 403). The §18 isolation proof stops
+                  being a script that gets run once and becomes a panel
+                  that is either green or wrong.
+
+    Stdlib only.
+    """
+    import json
+    import os
+    import socket
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    TENANT = os.environ.get("TENANT", "unknown")
+    OTHER_TENANT = os.environ.get("OTHER_TENANT", "")
+    PROBE_HOST = os.environ.get("PROBE_HOST", TENANT + "-hostprobe.service.consul")
+    PROBE_PORT = os.environ.get("PROBE_PORT", "28001")
+    CONSUL_ADDR = os.environ.get("CONSUL_HTTP_ADDR", "http://192.168.1.51:8500")
+    CONSUL_TOKEN = os.environ.get("CONSUL_TOKEN", "").strip()
+    LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+    TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "3"))
+
+
+    def resolve(name):
+        started = time.time()
+        try:
+            addr = socket.gethostbyname(name)
+            return {"name": name, "address": addr, "ms": round((time.time() - started) * 1000, 1), "error": None}
+        except Exception as exc:
+            return {"name": name, "address": None, "ms": None, "error": str(exc)}
+
+
+    def fetch_probe():
+        url = "http://%s:%s/api/probe" % (PROBE_HOST, PROBE_PORT)
+        started = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            return {"url": url, "ok": True, "ms": round((time.time() - started) * 1000, 1), "data": body, "error": None}
+        except Exception as exc:
+            return {"url": url, "ok": False, "ms": None, "data": None, "error": str(exc)}
+
+
+    def consul_status(service):
+        """Return the HTTP status Consul gives this tenant's token for a service."""
+        url = "%s/v1/health/service/%s" % (CONSUL_ADDR, service)
+        req = urllib.request.Request(url)
+        if CONSUL_TOKEN:
+            req.add_header("X-Consul-Token", CONSUL_TOKEN)
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                instances = json.loads(resp.read().decode("utf-8"))
+            return {"service": service, "status": resp.status, "instances": len(instances), "error": None}
+        except urllib.error.HTTPError as exc:
+            return {"service": service, "status": exc.code, "instances": None, "error": exc.reason}
+        except Exception as exc:
+            return {"service": service, "status": None, "instances": None, "error": str(exc)}
+
+
+    def isolation_check():
+        if not CONSUL_TOKEN:
+            return {"configured": False, "verdict": "no token", "own": None, "other": None}
+        own = consul_status(TENANT + "-hostprobe")
+        other = consul_status(OTHER_TENANT + "-hostprobe") if OTHER_TENANT else None
+        verdict = "unclear"
+        if own.get("status") == 200 and other and other.get("status") == 403:
+            verdict = "enforced"
+        elif own.get("status") == 200 and other and other.get("status") == 200:
+            verdict = "LEAKED"
+        return {"configured": True, "verdict": verdict, "own": own, "other": other}
+
+
+    def snapshot():
+        dns = resolve(PROBE_HOST)
+        probe = fetch_probe()
+        return {
+            "tenant": TENANT,
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "portal": {
+                "orchestrator": "kubernetes",
+                "pod": os.environ.get("POD_NAME"),
+                "pod_ip": os.environ.get("POD_IP"),
+                "namespace": os.environ.get("POD_NAMESPACE"),
+                "node": os.environ.get("NODE_NAME"),
+            },
+            "discovery": dns,
+            "probe": probe,
+            "isolation": isolation_check(),
+        }
+
+
+    STYLE = """
+    :root {
+      --ink: #0d1220; --panel: #151d33; --line: #253154;
+      --text: #c9d3ec; --dim: #7d89ab; --live: #52d4c3;
+      --warn: #f0a955; --dead: #f2617a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--ink); color: var(--text);
+      font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background-image: linear-gradient(var(--panel) 1px, transparent 1px),
+                        linear-gradient(90deg, var(--panel) 1px, transparent 1px);
+      background-size: 48px 48px; background-position: -1px -1px;
+    }
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 40px 20px 64px; }
+    .eyebrow {
+      font-size: 11px; letter-spacing: .22em; text-transform: uppercase;
+      color: var(--dim); margin: 0 0 6px;
+    }
+    h1 {
+      font-family: "Helvetica Neue", Arial, sans-serif; font-weight: 700;
+      font-size: 30px; letter-spacing: -.02em; margin: 0 0 4px; color: #fff;
+    }
+    .sub { color: var(--dim); margin: 0 0 32px; font-size: 13px; }
+    .link {
+      display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+      gap: 14px; padding: 22px; border: 1px solid var(--line);
+      background: rgba(21,29,51,.82); border-radius: 3px; margin-bottom: 28px;
+    }
+    .node { text-align: center; }
+    .node b { display: block; color: #fff; font-size: 15px; }
+    .node span { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim); }
+    .hop { text-align: center; min-width: 190px; }
+    .hop .bar { height: 2px; background: var(--live); margin: 10px 0 8px; }
+    .hop.down .bar { background: var(--dead); background-image: linear-gradient(90deg, var(--dead) 6px, transparent 6px); background-size: 12px 2px; }
+    .hop small { color: var(--dim); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .panel { border: 1px solid var(--line); background: rgba(21,29,51,.82); padding: 18px 20px; border-radius: 3px; }
+    .panel h2 { font-size: 11px; letter-spacing: .2em; text-transform: uppercase; color: var(--dim); margin: 0 0 14px; font-weight: 600; }
+    .row { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; border-bottom: 1px dotted rgba(37,49,84,.9); }
+    .row:last-child { border-bottom: 0; }
+    .row span { color: var(--dim); }
+    .row b { font-weight: 500; color: var(--text); text-align: right; word-break: break-all; }
+    .tag { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; padding: 2px 8px; border: 1px solid currentColor; border-radius: 2px; }
+    .ok { color: var(--live); } .bad { color: var(--dead); } .meh { color: var(--warn); }
+    footer { color: var(--dim); font-size: 12px; margin-top: 28px; }
+    a { color: var(--live); }
+    @media (max-width: 640px) { .link { grid-template-columns: 1fr; } }
+    """
+
+
+    def esc(value):
+        return (str(value)
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+    def rows(pairs):
+        out = []
+        for label, value in pairs:
+            out.append('<div class="row"><span>%s</span><b>%s</b></div>' % (esc(label), esc(value)))
+        return "".join(out)
+
+
+    def render(snap):
+        probe = snap["probe"]
+        dns = snap["discovery"]
+        iso = snap["isolation"]
+        host = (probe["data"] or {}).get("host", {})
+        nomad = (probe["data"] or {}).get("nomad", {})
+        mem = host.get("memory") or {}
+        disk = host.get("disk") or {}
+
+        hop_class = "hop" if probe["ok"] else "hop down"
+        hop_label = ("%s ms" % probe["ms"]) if probe["ok"] else "no answer"
+
+        if iso["verdict"] == "enforced":
+            iso_tag = '<span class="tag ok">enforced</span>'
+        elif iso["verdict"] == "LEAKED":
+            iso_tag = '<span class="tag bad">leaked</span>'
+        else:
+            iso_tag = '<span class="tag meh">%s</span>' % esc(iso["verdict"])
+
+        iso_rows = [("token", "configured" if iso["configured"] else "not set — see README")]
+        if iso["own"]:
+            iso_rows.append(("read own service", "HTTP %s" % iso["own"]["status"]))
+        if iso["other"]:
+            iso_rows.append(("read other tenant", "HTTP %s (expect 403)" % iso["other"]["status"]))
+
+        parts = [
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+            "<meta http-equiv='refresh' content='15'>",
+            "<title>%s · hybrid app</title><style>%s</style></head><body><div class='wrap'>" % (esc(snap["tenant"]), STYLE),
+            "<p class='eyebrow'>cloudlab · tenant %s</p>" % esc(snap["tenant"]),
+            "<h1>Two orchestrators, one service catalog</h1>",
+            "<p class='sub'>This page runs on k3s. Everything below the link came from a machine k3s does not manage.</p>",
+            "<div class='link'>",
+            "<div class='node'><span>kubernetes · .50</span><b>portal</b></div>",
+            "<div class='%s'><small>consul dns</small><div class='bar'></div><small>%s</small></div>" % (hop_class, esc(hop_label)),
+            "<div class='node'><span>nomad · .51</span><b>hostprobe</b></div>",
+            "</div>",
+            "<div class='grid'>",
+            "<div class='panel'><h2>Discovery</h2>%s</div>" % rows([
+                ("name", dns["name"]),
+                ("resolved to", dns["address"] or dns["error"]),
+                ("lookup", "%s ms" % dns["ms"] if dns["ms"] is not None else "failed"),
+                ("endpoint", probe["url"]),
+            ]),
+            "<div class='panel'><h2>Nomad host</h2>%s</div>" % (
+                rows([
+                    ("hostname", host.get("hostname")),
+                    ("kernel", host.get("kernel")),
+                    ("uptime", "%s h" % round((host.get("uptime_seconds") or 0) / 3600, 1)),
+                    ("load", ", ".join(str(v) for v in (host.get("load_average") or []))),
+                    ("memory used", "%s%% of %s MB" % (mem.get("used_percent"), mem.get("total_mb"))),
+                    ("disk free", "%s GB of %s GB" % (disk.get("free_gb"), disk.get("total_gb"))),
+                ]) if probe["ok"] else
+                "<div class='row'><span>error</span><b class='bad'>%s</b></div>" % esc(probe["error"])
+            ),
+            "<div class='panel'><h2>Allocation</h2>%s</div>" % rows([
+                ("nomad namespace", nomad.get("namespace")),
+                ("job", nomad.get("job")),
+                ("alloc", (nomad.get("alloc_id") or "")[:8]),
+                ("client", nomad.get("node")),
+            ]),
+            "<div class='panel'><h2>Isolation %s</h2>%s</div>" % (iso_tag, rows(iso_rows)),
+            "<div class='panel'><h2>This pod</h2>%s</div>" % rows([
+                ("pod", snap["portal"]["pod"]),
+                ("pod ip", snap["portal"]["pod_ip"]),
+                ("namespace", snap["portal"]["namespace"]),
+                ("node", snap["portal"]["node"]),
+            ]),
+            "</div>",
+            "<footer>Checked %s · refreshes every 15s · <a href='/api/status'>raw JSON</a></footer>" % esc(snap["checked_at"]),
+            "</div></body></html>",
+        ]
+        return "".join(parts)
+
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, body, content_type):
+            raw = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path == "/healthz":
+                self._send(200, "ok", "text/plain")
+            elif path == "/api/status":
+                self._send(200, json.dumps(snapshot(), indent=2), "application/json")
+            elif path == "/":
+                self._send(200, render(snapshot()), "text/html; charset=utf-8")
+            else:
+                self._send(404, json.dumps({"error": "no such path", "path": path}), "application/json")
+
+        def log_message(self, fmt, *args):
+            print("%s %s" % (self.address_string(), fmt % args), flush=True)
+
+
+    if __name__ == "__main__":
+        print("portal tenant=%s probe=%s:%s listening on :%d" % (TENANT, PROBE_HOST, PROBE_PORT, LISTEN_PORT), flush=True)
+        ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+  namespace: __TENANT__
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: hybrid-app
+    cloudlab.tenant: __TENANT__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: portal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portal
+        app.kubernetes.io/part-of: hybrid-app
+        cloudlab.tenant: __TENANT__
+    spec:
+      containers:
+        - name: portal
+          image: python:3.12-alpine
+          command: ["python3", "/app/portal.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: TENANT
+              value: "__TENANT__"
+            - name: OTHER_TENANT
+              value: "__OTHER_TENANT__"
+            - name: PROBE_HOST
+              value: "__TENANT__-hostprobe.service.consul"
+            - name: PROBE_PORT
+              value: "__PROBE_PORT__"
+            - name: CONSUL_HTTP_ADDR
+              value: "http://192.168.1.51:8500"
+            # Optional. Created out of band from Vault — see README.
+            # The pod starts and the dashboard works without it; only
+            # the isolation panel degrades to "no token".
+            - name: CONSUL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: portal-consul
+                  key: token
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          # Both requests and limits are set on purpose: the namespace
+          # ResourceQuota (Part 8) rejects pods that omit them.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: code
+          configMap:
+            name: portal-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+  namespace: __TENANT__
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: hybrid-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: portal
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: portal
+  namespace: __TENANT__
+  labels:
+    app.kubernetes.io/name: portal
+    app.kubernetes.io/part-of: hybrid-app
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: __TENANT__-portal.cloudlab.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: portal
+                port:
+                  number: 80

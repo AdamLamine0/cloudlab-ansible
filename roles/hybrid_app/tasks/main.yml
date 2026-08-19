@@ -1,0 +1,258 @@
+---
+# roles/hybrid_app/tasks/main.yml
+#
+# Deploys one tenant's half-and-half app:
+#   - hostprobe  -> Nomad on .51, in namespace {{ tenant }}
+#   - portal     -> k3s on .50, in namespace {{ tenant }}
+#
+# Runs against localhost (the `auto` control node / CI runner) and
+# reaches both VMs with delegate_to, so the whole deploy is one play with
+# one inventory pattern. Tokens are read from Vault at run time and are
+# never written to the repo, the runner's disk, or the job log.
+#
+# Idempotent: re-running with no changes leaves both orchestrators alone.
+
+- name: Assert required variables are set
+  ansible.builtin.assert:
+    that:
+      - tenant is defined and tenant | length > 0
+      - tenant in hybrid_app_tenant_ports
+      - groups['kube_prod'] is defined and groups['kube_prod'] | length > 0
+      - groups['nomad_prod'] is defined and groups['nomad_prod'] | length > 0
+    fail_msg: >-
+      tenant must be one of {{ hybrid_app_tenant_ports.keys() | list }},
+      and inventory.ini must define both kube_prod and nomad_prod.
+
+- name: Set per-tenant facts
+  ansible.builtin.set_fact:
+    probe_port: "{{ hybrid_app_tenant_ports[tenant] }}"
+    kube_host: "{{ groups['kube_prod'][0] }}"
+    nomad_host: "{{ groups['nomad_prod'][0] }}"
+
+# --------------------------------------------------------------------
+# Vault. Sealed Vault is the single most likely reason this whole
+# deploy fails, and it seals on EVERY vault-0 restart by design
+# (Part 9). Fail here with a message that says so, rather than 40
+# lines later on a confusing 403.
+# --------------------------------------------------------------------
+
+- name: Check Vault seal status
+  ansible.builtin.command:
+    cmd: kubectl exec -n vault vault-0 -- vault status -format=json
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: vault_status
+  changed_when: false
+  failed_when: false
+
+- name: Fail clearly if Vault is sealed or unreachable
+  ansible.builtin.fail:
+    msg: >-
+      Vault is sealed or unreachable, so tenant tokens cannot be read.
+      Unseal it with three of the five keys (Part 9 / Part 17), then
+      re-run this deploy. Vault seals on every vault-0 restart; this is
+      expected behaviour, not a fault.
+  when: >-
+    vault_status.rc != 0 or
+    (vault_status.stdout | default('{}') | from_json).sealed | default(true)
+
+- name: Read the Nomad namespace token for {{ tenant }} from Vault
+  ansible.builtin.command:
+    cmd: >-
+      kubectl exec -n vault vault-0 --
+      vault kv get -field={{ hybrid_app_vault_nomad_field }}
+      {{ hybrid_app_vault_nomad_path }}/{{ tenant }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: nomad_token_result
+  changed_when: false
+  no_log: true
+
+- name: Read the Consul tenant token for {{ tenant }} from Vault
+  ansible.builtin.command:
+    cmd: >-
+      kubectl exec -n vault vault-0 --
+      vault kv get -field={{ hybrid_app_vault_consul_field }}
+      {{ hybrid_app_vault_consul_path }}/{{ tenant }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: consul_token_result
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Stash tokens as facts
+  ansible.builtin.set_fact:
+    nomad_token: "{{ nomad_token_result.stdout | trim }}"
+    consul_token: "{{ consul_token_result.stdout | default('') | trim }}"
+  no_log: true
+
+# --------------------------------------------------------------------
+# Nomad half
+# --------------------------------------------------------------------
+
+- name: Ensure the app directory exists on the Nomad node
+  ansible.builtin.file:
+    path: "{{ hybrid_app_remote_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: "{{ nomad_host }}"
+
+- name: Copy the hostprobe jobspec to the Nomad node
+  ansible.builtin.copy:
+    src: "{{ hybrid_app_src_dir }}/nomad/probe.nomad.hcl"
+    dest: "{{ hybrid_app_remote_dir }}/probe.nomad.hcl"
+    owner: root
+    group: root
+    mode: "0640"
+  delegate_to: "{{ nomad_host }}"
+
+# `nomad job plan` returns 1 when changes are pending — that is a normal
+# outcome, not an error, so rc 0 and 1 are both accepted here.
+- name: Plan the hostprobe job (dry run, always)
+  ansible.builtin.command:
+    cmd: >-
+      nomad job plan
+      -var=tenant={{ tenant }}
+      -var=port={{ probe_port }}
+      {{ hybrid_app_remote_dir }}/probe.nomad.hcl
+  environment:
+    NOMAD_ADDR: "{{ hybrid_app_nomad_addr }}"
+    NOMAD_TOKEN: "{{ nomad_token }}"
+  delegate_to: "{{ nomad_host }}"
+  register: probe_plan
+  changed_when: false
+  failed_when: probe_plan.rc not in [0, 1]
+  no_log: true
+
+- name: Show the plan summary
+  ansible.builtin.debug:
+    msg: "{{ probe_plan.stdout_lines | default([]) | select('search', '(Job|Task Group|\\+|-)') | list | default(['no diff']) }}"
+
+- name: Run the hostprobe job in namespace {{ tenant }}
+  ansible.builtin.command:
+    cmd: >-
+      nomad job run
+      -var=tenant={{ tenant }}
+      -var=port={{ probe_port }}
+      {{ hybrid_app_remote_dir }}/probe.nomad.hcl
+  environment:
+    NOMAD_ADDR: "{{ hybrid_app_nomad_addr }}"
+    NOMAD_TOKEN: "{{ nomad_token }}"
+  delegate_to: "{{ nomad_host }}"
+  register: probe_run
+  changed_when: "'Deployment' in probe_run.stdout or 'Evaluation' in probe_run.stdout"
+  when: not ansible_check_mode
+  no_log: true
+
+# --------------------------------------------------------------------
+# Kubernetes half
+# --------------------------------------------------------------------
+
+- name: Render the portal manifest for {{ tenant }}
+  ansible.builtin.command:
+    cmd: "{{ hybrid_app_src_dir }}/scripts/render-portal.sh {{ tenant }}"
+  delegate_to: localhost
+  register: rendered_portal
+  changed_when: false
+
+- name: Ship the rendered manifest to the k3s node
+  ansible.builtin.copy:
+    content: "{{ rendered_portal.stdout }}\n"
+    dest: "{{ hybrid_app_remote_dir }}/portal-{{ tenant }}.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  delegate_to: "{{ kube_host }}"
+
+- name: Upsert the Consul token secret for the portal
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail &&
+      kubectl -n {{ tenant }} create secret generic portal-consul
+      --from-literal=token='{{ consul_token }}'
+      --dry-run=client -o yaml | kubectl apply -f -
+    executable: /bin/bash
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: secret_apply
+  changed_when: "'configured' in secret_apply.stdout or 'created' in secret_apply.stdout"
+  when:
+    - consul_token | length > 0
+    - not ansible_check_mode
+  no_log: true
+
+- name: Warn if no Consul token was available
+  ansible.builtin.debug:
+    msg: >-
+      No Consul token found at {{ hybrid_app_vault_consul_path }}/{{ tenant }}.
+      The portal will still run; its isolation panel will read "no token".
+      Confirm the real Vault path and set hybrid_app_vault_consul_path.
+  when: consul_token | length == 0
+
+- name: Apply the portal manifest
+  ansible.builtin.command:
+    cmd: "kubectl apply -f {{ hybrid_app_remote_dir }}/portal-{{ tenant }}.yaml"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: portal_apply
+  changed_when: "'configured' in portal_apply.stdout or 'created' in portal_apply.stdout"
+  when: not ansible_check_mode
+
+- name: Restart the portal so a rotated token or new code is picked up
+  ansible.builtin.command:
+    cmd: "kubectl -n {{ tenant }} rollout restart deploy/portal"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - portal_apply is changed or secret_apply is changed
+
+- name: Wait for the portal rollout to finish
+  ansible.builtin.command:
+    cmd: "kubectl -n {{ tenant }} rollout status deploy/portal --timeout=120s"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+# --------------------------------------------------------------------
+# Proof. The deploy is not "done" until the cross-orchestrator path is
+# shown working end to end, so the verify script is part of the deploy,
+# not a separate thing someone remembers to run.
+# --------------------------------------------------------------------
+
+- name: Copy the verification script to the k3s node
+  ansible.builtin.copy:
+    src: "{{ hybrid_app_src_dir }}/scripts/verify-hybrid.sh"
+    dest: "{{ hybrid_app_remote_dir }}/verify-hybrid.sh"
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: "{{ kube_host }}"
+
+- name: Verify the hybrid path for {{ tenant }}
+  ansible.builtin.command:
+    cmd: "{{ hybrid_app_remote_dir }}/verify-hybrid.sh {{ tenant }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  delegate_to: "{{ kube_host }}"
+  register: verify_result
+  changed_when: false
+  failed_when: verify_result.rc != 0
+  when: not ansible_check_mode
+
+- name: Show verification output
+  ansible.builtin.debug:
+    var: verify_result.stdout_lines
+  when: not ansible_check_mode

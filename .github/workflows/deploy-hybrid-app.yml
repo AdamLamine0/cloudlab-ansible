@@ -1,0 +1,86 @@
+---
+# .github/workflows/deploy-hybrid-app.yml
+#
+# Push to main that touches the app => deploy it to both orchestrators
+# and prove the cross-orchestrator path still works. This is the only
+# workflow that changes anything in the lab automatically, and it is
+# limited to APPLICATION workloads inside tenant namespaces. Nothing
+# here can reconfigure Consul, Nomad, k3s or a VM — that is
+# infra-apply.yml, and it is manual on purpose (README §2).
+name: deploy hybrid app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hybrid-app/**'
+      - 'ansible/roles/hybrid_app/**'
+      - 'ansible/playbook-hybrid-app.yml'
+      - '.github/workflows/deploy-hybrid-app.yml'
+  workflow_dispatch:
+    inputs:
+      tenants:
+        description: 'JSON list of tenants to deploy'
+        required: false
+        default: '["user1","user2"]'
+
+# Never two deploys at once, and never cancel one midway — a half-applied
+# deploy is worse than a queued one.
+concurrency:
+  group: deploy-hybrid-app
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, cloudlab]
+    timeout-minutes: 20
+
+    env:
+      ANSIBLE_VAULT_PASSWORD_FILE: /home/auto/.ansible/vault-pass
+      ANSIBLE_HOST_KEY_CHECKING: 'False'
+      ANSIBLE_FORCE_COLOR: '1'
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      # The lab is a PC that gets switched off. Most deploy failures
+      # will be "something wasn't running", so say which thing, in one
+      # line, before spending twenty minutes proving it the hard way.
+      - name: Preflight
+        run: ./scripts/preflight.sh
+
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          ansible-playbook -i inventory.ini playbook-hybrid-app.yml \
+            -e "hybrid_app_src_dir=${GITHUB_WORKSPACE}/hybrid-app" \
+            -e 'hybrid_app_tenants=${{ github.event.inputs.tenants || '["user1","user2"]' }}'
+
+      # The role already runs verify-hybrid.sh and fails the play on a
+      # bad result, so this is not a second gate. It re-runs the checks
+      # through the same inventory (no hand-built ProxyCommand) so the
+      # PASS/FAIL lines land in their own collapsible block in the run
+      # log, where they stay readable weeks later.
+      - name: Record the verification output
+        if: always()
+        run: |
+          set -uo pipefail
+          rc=0
+          for tenant in user1 user2; do
+            echo "=== $tenant ==="
+            ansible kube_prod -i inventory.ini -m shell \
+              -a "KUBECONFIG=/etc/rancher/k3s/k3s.yaml /opt/cloudlab/hybrid-app/verify-hybrid.sh $tenant" || rc=1
+          done
+          exit $rc
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Hybrid app deploy"
+            echo ""
+            echo "- commit: \`${GITHUB_SHA:0:8}\`"
+            echo "- result: **${{ job.status }}**"
+            echo "- portals: http://user1-portal.cloudlab.internal, http://user2-portal.cloudlab.internal"
+          } >> "$GITHUB_STEP_SUMMARY"

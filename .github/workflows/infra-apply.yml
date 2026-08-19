@@ -1,0 +1,117 @@
+---
+# .github/workflows/infra-apply.yml
+#
+# The infrastructure playbooks (nomad_node, kube_node) rewrite network
+# config, ACL state and service configuration on live VMs. Those DO NOT
+# run on push. This workflow is manual only, defaults to check mode, and
+# refuses to touch prod without an explicitly typed confirmation.
+#
+# Rationale in one line: a push to main is a statement about code, not a
+# decision to reconfigure a production ACL system.
+name: infra apply (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      playbook:
+        description: 'Which playbook to run'
+        required: true
+        type: choice
+        options:
+          - playbook-nomad.yml
+          - playbook-kube.yml
+          - playbook-nomad-terraform.yml
+          - playbook-kube-terraform.yml
+      target:
+        description: 'Inventory group to run against'
+        required: true
+        type: choice
+        options:
+          - nomad_test
+          - kube_test
+          - nomad_terraform
+          - kube_terraform
+          - nomad_prod
+          - kube_prod
+      mode:
+        description: 'check = dry run (safe), apply = make changes'
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - apply
+      confirm:
+        description: 'To apply against a *_prod group, type the group name here'
+        required: false
+        default: ''
+
+concurrency:
+  group: infra-apply
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: [self-hosted, cloudlab]
+    timeout-minutes: 45
+
+    env:
+      ANSIBLE_VAULT_PASSWORD_FILE: /home/auto/.ansible/vault-pass
+      ANSIBLE_HOST_KEY_CHECKING: 'False'
+      ANSIBLE_FORCE_COLOR: '1'
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Guard production
+        run: |
+          set -euo pipefail
+          target='${{ inputs.target }}'
+          mode='${{ inputs.mode }}'
+          confirm='${{ inputs.confirm }}'
+          case "$target" in
+            *_prod)
+              if [ "$mode" = "apply" ] && [ "$confirm" != "$target" ]; then
+                echo "Refusing: applying to $target requires typing '$target' in the confirm box." >&2
+                exit 1
+              fi
+              echo "Production target $target, mode $mode — proceeding."
+              ;;
+            *)
+              echo "Non-production target $target, mode $mode."
+              ;;
+          esac
+
+      - name: Preflight
+        run: ./scripts/preflight.sh
+
+      # `hosts:` inside the playbook is overridden here rather than
+      # trusted. The file's own hosts line is the thing that has already
+      # nearly caused a prod accident once (Part 12) — CI should not
+      # inherit that hazard.
+      - name: Run
+        run: |
+          set -euo pipefail
+          extra_args=""
+          if [ '${{ inputs.mode }}' = 'check' ]; then
+            extra_args="--check --diff"
+          fi
+          echo "TARGET: ${{ inputs.target }}   MODE: ${{ inputs.mode }}"
+          # shellcheck disable=SC2086
+          ansible-playbook -i inventory.ini '${{ inputs.playbook }}' \
+            --limit '${{ inputs.target }}' \
+            -e 'target_hosts=${{ inputs.target }}' \
+            $extra_args
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Infra run"
+            echo ""
+            echo "- playbook: \`${{ inputs.playbook }}\`"
+            echo "- target: \`${{ inputs.target }}\`"
+            echo "- mode: \`${{ inputs.mode }}\`"
+            echo "- result: **${{ job.status }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
