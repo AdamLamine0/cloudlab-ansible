@@ -92,8 +92,42 @@ jobs:
           set -euo pipefail
           cd terraform
           terraform fmt -check -recursive
+          # -backend=false: validate only checks syntax/types, so it doesn't
+          # need real Proxmox credentials or network access to a backend.
           terraform init -backend=false -input=false
           terraform validate
+
+      # Static security scan of everything that defines infrastructure or
+      # workload config: the Terraform (VM definitions, Proxmox provider)
+      # and the Kubernetes manifests (rendered, so the ConfigMap-embedded
+      # app is in scope too, same as the "Rendered portal manifests"
+      # step above).
+      #
+      # Two findings are pinned as accepted rather than fixed, with the
+      # reason inline — silently skipping checks with no explanation is
+      # worse than not scanning at all:
+      #   CKV_K8S_43  image should use a digest, not a tag. Deliberately
+      #               using the stock python:3.12-alpine tag until the
+      #               CI/CD phase gains an actual build step (see
+      #               hybrid-app/README.md) that would produce a digest
+      #               to pin.
+      #   CKV_K8S_35  prefer secrets as mounted files over env vars. The
+      #               Consul token is short-lived per Part 12's Nomad
+      #               token discipline and never logged (the role reads
+      #               it with no_log); moving it to a file adds
+      #               complexity out of proportion to the reduced risk
+      #               for a token this narrowly scoped.
+      - name: Security scan (Checkov — Terraform + Kubernetes)
+        run: |
+          set -euo pipefail
+          pip install --break-system-packages -q checkov
+          mkdir -p /tmp/ckv-render
+          for tenant in user1 user2; do
+            ./hybrid-app/scripts/render-portal.sh "$tenant" > "/tmp/ckv-render/portal-$tenant.yaml"
+          done
+          checkov -d terraform --framework terraform --compact --quiet
+          checkov -d /tmp/ckv-render --framework kubernetes --compact --quiet \
+            --skip-check CKV_K8S_43,CKV_K8S_35
 
       - name: Nomad jobspec is valid
         run: |

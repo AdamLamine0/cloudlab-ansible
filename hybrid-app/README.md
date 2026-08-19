@@ -224,7 +224,28 @@ chroot exposing `/proc` (every reader in the probe is individually
 guarded and degrades to `null`, so a missing path shows as a blank
 field, not a crash), and the ResourceQuota accepting the portal pod.
 
-## 9. Next, after this lands
+## 9. Security hardening (Checkov)
+
+The `portal` manifest is scanned with [Checkov](https://www.checkov.io/)
+in CI (`ci.yml`). Starting point was 12 findings; 10 are fixed directly
+in `k8s/portal.yaml`:
+
+- pod/container `securityContext`: non-root UID, no privilege
+  escalation, all capabilities dropped, read-only root filesystem
+  (safe — the app never writes to disk, confirmed by testing), default
+  seccomp profile
+- `automountServiceAccountToken: false` — the app never calls the k8s API
+- `imagePullPolicy: Always`
+- a `NetworkPolicy` restricting the pod to: inbound from Traefik only,
+  outbound to DNS and to `.51` (Consul + both tenant probe ports) only
+
+Two findings are accepted rather than fixed, with the reasoning next to
+the `--skip-check` in `ci.yml`: pinning the image by digest (blocked on
+the image-build step this project doesn't have yet) and moving the
+Consul token from an env var to a mounted file (added complexity not
+justified for a token this narrowly scoped and never logged).
+
+## 10. Next, after this lands
 
 1. Fold this into IaC — the manifests and jobspec belong in the
    `~/ansible` repo alongside the roles, not loose on a VM.

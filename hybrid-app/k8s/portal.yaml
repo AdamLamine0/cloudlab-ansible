@@ -320,10 +320,29 @@ spec:
         app.kubernetes.io/part-of: hybrid-app
         cloudlab.tenant: __TENANT__
     spec:
+      # The app never calls the Kubernetes API, so it has no use for its
+      # own service-account token (CKV_K8S_38).
+      automountServiceAccountToken: false
+      # Hardening for Checkov/kube-bench findings CKV_K8S_20/22/23/28/29/30/31/37:
+      # the app never writes to disk and needs no Linux capabilities, so all
+      # of this costs nothing at runtime.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534    # nobody — python:3.12-alpine has no app-specific user
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: portal
           image: python:3.12-alpine
+          imagePullPolicy: Always
           command: ["python3", "/app/portal.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
@@ -430,3 +449,52 @@ spec:
                 name: portal
                 port:
                   number: 80
+---
+# CKV2_K8S_6: every pod should have an associated NetworkPolicy. Default
+# k3s has no CNI-level isolation between namespaces, so without this any
+# pod anywhere could reach the portal, and the portal could reach
+# anything — undermining the tenant boundary the rest of this project
+# built. This does not replace the Consul ACL boundary (§18); it adds a
+# second, independent one at the network layer.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: portal
+  namespace: __TENANT__
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: portal
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Traefik (kube-system) is the only thing that should reach the
+    # portal directly; everything else goes through the Ingress.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS — required for the user1-hostprobe.service.consul lookup itself.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Consul and the Nomad-side probe both live on .51, outside the
+    # cluster's pod network, so this is an IP block rather than a
+    # podSelector/namespaceSelector.
+    - to:
+        - ipBlock:
+            cidr: 192.168.1.51/32
+      ports:
+        - protocol: TCP
+          port: 8500   # Consul HTTP API
+        - protocol: TCP
+          port: 28001  # user1 hostprobe
+        - protocol: TCP
+          port: 28002  # user2 hostprobe
