@@ -19,7 +19,7 @@ set -euo pipefail
 TOKEN="${1:-}"
 REPO_URL="https://github.com/AdamLamine0/cloudlab-ansible"
 RUNNER_DIR="$HOME/actions-runner"
-RUNNER_VERSION="2.319.1"
+RUNNER_VERSION="2.336.0"
 LABELS="cloudlab"
 
 [ -n "$TOKEN" ] || { echo "usage: $(basename "$0") <registration-token>" >&2; exit 2; }

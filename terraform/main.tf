@@ -37,7 +37,7 @@ resource "proxmox_virtual_environment_vm" "cloudlab_vm" {
   }
 
   vga {
-    type = "serial0"
+    type   = "serial0"
     memory = 16
   }
 
