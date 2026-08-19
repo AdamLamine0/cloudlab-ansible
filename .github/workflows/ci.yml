@@ -64,7 +64,7 @@ jobs:
           tenant = sys.argv[1]
           docs = [d for d in yaml.safe_load_all(open("/tmp/portal-%s.yaml" % tenant)) if d]
           kinds = {d["kind"] for d in docs}
-          assert kinds == {"ConfigMap", "Deployment", "Service", "Ingress"}, kinds
+          assert kinds == {"ConfigMap", "Deployment", "Service", "Ingress", "NetworkPolicy"}, kinds
           assert all(d["metadata"]["namespace"] == tenant for d in docs), "wrong namespace"
           code = [d for d in docs if d["kind"] == "ConfigMap"][0]["data"]["portal.py"]
           with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
