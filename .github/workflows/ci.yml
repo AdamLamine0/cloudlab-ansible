@@ -92,6 +92,7 @@ jobs:
           set -euo pipefail
           cd terraform
           terraform fmt -check -recursive
+          terraform init -backend=false -input=false
           terraform validate
 
       - name: Nomad jobspec is valid
@@ -111,4 +112,4 @@ jobs:
       - name: Report infra playbook targets
         run: |
           set -euo pipefail
-          grep -H 'hosts:' ansible/playbook-nomad.yml ansible/playbook-kube.yml || true
+          grep -H 'hosts:' playbook-nomad.yml playbook-kube.yml || true
