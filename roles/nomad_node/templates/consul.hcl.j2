@@ -15,5 +15,8 @@ acl {
   enabled        = true
   default_policy = "{{ consul_acl_default_policy }}"
   enable_token_persistence = true
+  tokens {
+    default = "{{ consul_dns_token }}"
+  }
 }
 {% endif %}

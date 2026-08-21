@@ -2,7 +2,7 @@
 # verify-hybrid.sh <user1|user2>
 #
 # End-to-end check of the hybrid app for one tenant. Run it from `kube`
-# (.50), where kubectl works. The Nomad checks are skipped automatically
+# (.50), where /usr/local/bin/kubectl works. The Nomad checks are skipped automatically
 # if the nomad CLI or NOMAD_TOKEN is not available there — run those
 # from the jumpbox instead.
 #
@@ -35,11 +35,17 @@ section "1. Consul DNS is reachable from inside the cluster"
 # in CoreDNS has silently vanished once already (Problem #34), and with
 # Consul ACLs on default_policy=deny the agent needs a DNS token or the
 # lookup returns nothing even when the zone is fine. See README.
-if kubectl run dns-check-$$ --image=busybox:1.36 --rm -i --restart=Never --quiet -- \
-     nslookup "$SVC" 2>/dev/null | grep -q 'Address'; then
-  pass "$SVC resolves from a pod"
+# Resolve from the portal pod that is already running, rather than
+# spawning a throwaway pod. `kubectl run --rm -i` races between the
+# container exiting and its logs being readable, which made this check
+# fail intermittently even when DNS was fine. The portal pod is also
+# the thing that actually needs this lookup to work.
+if /usr/local/bin/kubectl -n "$TENANT" exec deploy/portal -- \
+     python3 -c "import socket,sys; print(socket.gethostbyname(sys.argv[1]))" "$SVC" 2>&1 \
+     | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  pass "$SVC resolves from the portal pod"
 else
-  fail "$SVC does not resolve from a pod — check the CoreDNS consul:53 zone and Consul's DNS token"
+  fail "$SVC does not resolve from the portal pod — check the CoreDNS consul:53 zone and Consul's DNS token"
 fi
 
 section "2. Nomad side"
@@ -68,22 +74,25 @@ else
 fi
 
 section "4. Kubernetes side"
-if kubectl -n "$TENANT" rollout status deploy/portal --timeout=60s >/dev/null 2>&1; then
+if /usr/local/bin/kubectl -n "$TENANT" rollout status deploy/portal --timeout=60s >/dev/null 2>&1; then
   pass "portal deployment is available in namespace $TENANT"
 else
   fail "portal deployment is not available in namespace $TENANT"
 fi
 
 section "5. The actual hybrid path — portal reads the Nomad host through Consul"
-STATUS_JSON="$(kubectl -n "$TENANT" exec deploy/portal -- \
+STATUS_JSON="$(/usr/local/bin/kubectl -n "$TENANT" exec deploy/portal -- \
   python3 -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/api/status',timeout=8).read().decode())" 2>/dev/null)"
 if [ -z "$STATUS_JSON" ]; then
   fail "could not read /api/status from the portal pod"
 else
-  echo "$STATUS_JSON" | python3 - "$TENANT" <<'PY'
+  # The JSON is passed as argv[2], NOT on stdin: `python3 -` reads the
+  # program from stdin, and the heredoc already owns stdin, so a piped
+  # payload never arrives and json.load() sees an empty string.
+  python3 - "$TENANT" "$STATUS_JSON" <<'PY'
 import json, sys
-snap = json.load(sys.stdin)
 tenant = sys.argv[1]
+snap = json.loads(sys.argv[2])
 probe = snap["probe"]
 iso = snap["isolation"]
 ok = True
@@ -102,7 +111,8 @@ else:
 if not iso["configured"]:
     print("  SKIP  isolation panel — no Consul token in the portal-consul secret")
 elif iso["verdict"] == "enforced":
-    print("  PASS  Consul isolation enforced (own=200, other=403)")
+    print("  PASS  Consul isolation enforced (own sees %s instance(s), other sees %s)"
+          % (iso["own"]["instances"], iso["other"]["instances"] if iso["other"] else "n/a"))
 else:
     print("  FAIL  Consul isolation verdict: %s (%s)" % (iso["verdict"], iso))
     ok = False

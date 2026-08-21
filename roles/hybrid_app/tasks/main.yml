@@ -36,13 +36,24 @@
 # lines later on a confusing 403.
 # --------------------------------------------------------------------
 
+
 - name: Check Vault seal status
   ansible.builtin.command:
-    cmd: kubectl exec -n vault vault-0 -- vault status -format=json
+    cmd: /usr/local/bin/kubectl exec -n vault vault-0 -- vault status -format=json
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: vault_status
+
+- name: DEBUG vault_status
+  ansible.builtin.debug:
+    var: vault_status
+
+- name: DEBUG vault_status
+  ansible.builtin.debug:
+    var: vault_status
+
   changed_when: false
   failed_when: false
 
@@ -60,12 +71,13 @@
 - name: Read the Nomad namespace token for {{ tenant }} from Vault
   ansible.builtin.command:
     cmd: >-
-      kubectl exec -n vault vault-0 --
+      /usr/local/bin/kubectl exec -n vault vault-0 --
       vault kv get -field={{ hybrid_app_vault_nomad_field }}
       {{ hybrid_app_vault_nomad_path }}/{{ tenant }}
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: nomad_token_result
   changed_when: false
   no_log: true
@@ -73,12 +85,13 @@
 - name: Read the Consul tenant token for {{ tenant }} from Vault
   ansible.builtin.command:
     cmd: >-
-      kubectl exec -n vault vault-0 --
+      /usr/local/bin/kubectl exec -n vault vault-0 --
       vault kv get -field={{ hybrid_app_vault_consul_field }}
       {{ hybrid_app_vault_consul_path }}/{{ tenant }}
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: consul_token_result
   changed_when: false
   failed_when: false
@@ -102,6 +115,7 @@
     group: root
     mode: "0750"
   delegate_to: "{{ nomad_host }}"
+  connection: ssh
 
 - name: Copy the hostprobe jobspec to the Nomad node
   ansible.builtin.copy:
@@ -111,6 +125,7 @@
     group: root
     mode: "0640"
   delegate_to: "{{ nomad_host }}"
+  connection: ssh
 
 # `nomad job plan` returns 1 when changes are pending — that is a normal
 # outcome, not an error, so rc 0 and 1 are both accepted here.
@@ -125,6 +140,7 @@
     NOMAD_ADDR: "{{ hybrid_app_nomad_addr }}"
     NOMAD_TOKEN: "{{ nomad_token }}"
   delegate_to: "{{ nomad_host }}"
+  connection: ssh
   register: probe_plan
   changed_when: false
   failed_when: probe_plan.rc not in [0, 1]
@@ -145,6 +161,7 @@
     NOMAD_ADDR: "{{ hybrid_app_nomad_addr }}"
     NOMAD_TOKEN: "{{ nomad_token }}"
   delegate_to: "{{ nomad_host }}"
+  connection: ssh
   register: probe_run
   changed_when: "'Deployment' in probe_run.stdout or 'Evaluation' in probe_run.stdout"
   when: not ansible_check_mode
@@ -161,6 +178,16 @@
   register: rendered_portal
   changed_when: false
 
+- name: Ensure the app directory exists on the k3s node
+  ansible.builtin.file:
+    path: "{{ hybrid_app_remote_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: "{{ kube_host }}"
+  connection: ssh
+
 - name: Ship the rendered manifest to the k3s node
   ansible.builtin.copy:
     content: "{{ rendered_portal.stdout }}\n"
@@ -169,18 +196,20 @@
     group: root
     mode: "0640"
   delegate_to: "{{ kube_host }}"
+  connection: ssh
 
 - name: Upsert the Consul token secret for the portal
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail &&
-      kubectl -n {{ tenant }} create secret generic portal-consul
+      /usr/local/bin/kubectl -n {{ tenant }} create secret generic portal-consul
       --from-literal=token='{{ consul_token }}'
-      --dry-run=client -o yaml | kubectl apply -f -
+      --dry-run=client -o yaml | /usr/local/bin/kubectl apply -f -
     executable: /bin/bash
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: secret_apply
   changed_when: "'configured' in secret_apply.stdout or 'created' in secret_apply.stdout"
   when:
@@ -198,20 +227,22 @@
 
 - name: Apply the portal manifest
   ansible.builtin.command:
-    cmd: "kubectl apply -f {{ hybrid_app_remote_dir }}/portal-{{ tenant }}.yaml"
+    cmd: "/usr/local/bin/kubectl apply -f {{ hybrid_app_remote_dir }}/portal-{{ tenant }}.yaml"
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: portal_apply
   changed_when: "'configured' in portal_apply.stdout or 'created' in portal_apply.stdout"
   when: not ansible_check_mode
 
 - name: Restart the portal so a rotated token or new code is picked up
   ansible.builtin.command:
-    cmd: "kubectl -n {{ tenant }} rollout restart deploy/portal"
+    cmd: "/usr/local/bin/kubectl -n {{ tenant }} rollout restart deploy/portal"
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   changed_when: true
   when:
     - not ansible_check_mode
@@ -219,10 +250,11 @@
 
 - name: Wait for the portal rollout to finish
   ansible.builtin.command:
-    cmd: "kubectl -n {{ tenant }} rollout status deploy/portal --timeout=120s"
+    cmd: "/usr/local/bin/kubectl -n {{ tenant }} rollout status deploy/portal --timeout=120s"
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   changed_when: false
   when: not ansible_check_mode
 
@@ -240,6 +272,7 @@
     group: root
     mode: "0750"
   delegate_to: "{{ kube_host }}"
+  connection: ssh
 
 - name: Verify the hybrid path for {{ tenant }}
   ansible.builtin.command:
@@ -247,6 +280,7 @@
   environment:
     KUBECONFIG: /etc/rancher/k3s/k3s.yaml
   delegate_to: "{{ kube_host }}"
+  connection: ssh
   register: verify_result
   changed_when: false
   failed_when: verify_result.rc != 0

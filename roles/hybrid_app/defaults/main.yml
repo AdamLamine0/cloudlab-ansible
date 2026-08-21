@@ -21,7 +21,7 @@ hybrid_app_nomad_addr: "http://192.168.1.51:4646"
 # cloudlab/nomad/... and cloudlab/consul/..., but the exact per-tenant
 # key and field names were never captured on screen (they were hidden by
 # no_log during the ACL rollout).
-hybrid_app_vault_nomad_path: "cloudlab/nomad"
+hybrid_app_vault_nomad_path: "cloudlab/nomad/acl"
 hybrid_app_vault_nomad_field: "token"
-hybrid_app_vault_consul_path: "cloudlab/consul"
+hybrid_app_vault_consul_path: "cloudlab/consul/acl"
 hybrid_app_vault_consul_field: "token"

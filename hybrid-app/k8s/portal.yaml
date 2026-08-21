@@ -103,10 +103,20 @@ data:
             return {"configured": False, "verdict": "no token", "own": None, "other": None}
         own = consul_status(TENANT + "-hostprobe")
         other = consul_status(OTHER_TENANT + "-hostprobe") if OTHER_TENANT else None
+        # Consul's health endpoints do NOT return 403 for a service the
+        # token cannot read \u2014 they return 200 with the unauthorised
+        # instances filtered out. So the signal for enforcement is
+        # "other returns no instances", not "other returns 403".
+        # Testing this by status code alone would wrongly report a leak.
         verdict = "unclear"
-        if own.get("status") == 200 and other and other.get("status") == 403:
+        own_ok = own.get("status") == 200 and (own.get("instances") or 0) > 0
+        if other is None:
+            verdict = "no peer configured"
+        elif other.get("status") == 403:
             verdict = "enforced"
-        elif own.get("status") == 200 and other and other.get("status") == 200:
+        elif own_ok and (other.get("instances") or 0) == 0:
+            verdict = "enforced"
+        elif own_ok and (other.get("instances") or 0) > 0:
             verdict = "LEAKED"
         return {"configured": True, "verdict": verdict, "own": own, "other": other}
 
