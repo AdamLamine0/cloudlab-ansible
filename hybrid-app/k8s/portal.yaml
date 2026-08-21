@@ -226,7 +226,7 @@ data:
         if iso["own"]:
             iso_rows.append(("read own service", "HTTP %s" % iso["own"]["status"]))
         if iso["other"]:
-            iso_rows.append(("read other tenant", "HTTP %s (expect 403)" % iso["other"]["status"]))
+            iso_rows.append(("read other tenant", "%s instance(s) visible — expect 0" % (iso["other"]["instances"] if iso["other"]["instances"] is not None else "n/a")))
 
         parts = [
             "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
