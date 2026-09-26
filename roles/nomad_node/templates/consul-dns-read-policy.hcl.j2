@@ -1,0 +1,12 @@
+# Read-only. Lets the Consul AGENT ITSELF answer *.service.consul DNS
+# queries under default_policy=deny — DNS queries arrive with no token
+# of their own, so the agent needs its own read rights to serve them
+# (see handoff Part 16 step 9, and Problem #34/#94 for why this exists).
+
+node_prefix "" {
+  policy = "read"
+}
+
+service_prefix "" {
+  policy = "read"
+}

@@ -499,6 +499,78 @@
     - consul_nomad_token_create is changed
   no_log: true
 
+# WAVE 3: Consul agent DNS-read token (handoff Part 16 step 9, Part 18
+# item 3, Problem #34/#94). Makes the dns-read policy/token pair created
+# by hand during that session REPRODUCIBLE — if Consul's ACL/raft state
+# is ever wiped, this recreates both instead of leaving consul_dns_token
+# in Vault pointing at nothing. Same idempotent shape as waves 1 and 2.
+
+- name: Consul ACL (wave 3) | write DNS-read policy file
+  ansible.builtin.template:
+    src: consul-dns-read-policy.hcl.j2
+    dest: "/etc/consul-acl-policies/policy-dns-read.hcl"
+    mode: "0640"
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 3) | create/update DNS-read policy
+  ansible.builtin.command: >
+    consul acl policy create
+    -name="dns-read"
+    -description="Catalog read for agent DNS resolution"
+    -rules=@/etc/consul-acl-policies/policy-dns-read.hcl
+    -token="{{ consul_bootstrap_token }}"
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_dns_read_policy_create
+  failed_when:
+    - consul_dns_read_policy_create.rc != 0
+    - "'already exists' not in consul_dns_read_policy_create.stderr"
+  changed_when: "'already exists' not in consul_dns_read_policy_create.stderr"
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 3) | check if DNS-read token already exists in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv get -field=token {{ consul_acl_vault_path }}/dns-read
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: consul_dns_read_token_existing
+  ignore_errors: true
+  changed_when: false
+  no_log: true
+  when: consul_acl_enabled
+
+- name: Consul ACL (wave 3) | create DNS-read token (only if not already in Vault)
+  ansible.builtin.command: >
+    consul acl token create
+    -description="agent DNS default token"
+    -policy-name="dns-read"
+    -format=json
+  environment:
+    CONSUL_HTTP_TOKEN: "{{ consul_bootstrap_token }}"
+  register: consul_dns_read_token_create
+  when:
+    - consul_acl_enabled
+    - consul_dns_read_token_existing is failed
+  changed_when: true
+  no_log: true
+
+- name: Consul ACL (wave 3) | store new DNS-read token in Vault
+  ansible.builtin.command: >
+    kubectl exec -n vault vault-0 --
+    vault kv put {{ consul_acl_vault_path }}/dns-read
+    token={{ (consul_dns_read_token_create.stdout | from_json).SecretID }}
+  delegate_to: "{{ consul_acl_vault_delegate_host }}"
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  when:
+    - consul_acl_enabled
+    - consul_dns_read_token_create is defined
+    - consul_dns_read_token_create is changed
+  no_log: true
+
 - name: Consul ACL (wave 2) | fetch Nomad-integration token from Vault (every run)
   ansible.builtin.command: >
     kubectl exec -n vault vault-0 --

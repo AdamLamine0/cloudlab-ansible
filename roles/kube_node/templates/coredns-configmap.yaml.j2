@@ -1,34 +1,25 @@
+# coredns-custom, NOT the "coredns" ConfigMap.
+#
+# k3s's addon controller owns and periodically reconciles the "coredns"
+# ConfigMap back to its stock template — any hand-added or templated
+# zone written directly into it gets silently discarded (see handoff
+# Problem #34, and its full root-cause writeup in Part 16 step 8: the
+# zone was found missing from the LIVE Corefile while a stale
+# `objectset.rio.cattle.io/applied` annotation still showed it,
+# proving reconciliation had already overwritten it at some point).
+#
+# k3s's stock Corefile already imports this extension point itself
+# (`import /etc/coredns/custom/*.server`), so writing the zone here
+# survives reconciliation instead of fighting it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: coredns
+  name: coredns-custom
   namespace: kube-system
 data:
-  Corefile: |
-    .:53 {
-        errors
-        health
-        ready
-        kubernetes cluster.local in-addr.arpa ip6.arpa {
-          pods insecure
-          fallthrough in-addr.arpa ip6.arpa
-        }
-        hosts /etc/coredns/NodeHosts {
-          ttl 60
-          reload 15s
-          fallthrough
-        }
-        prometheus :9153
-        cache 30
-        loop
-        reload
-        loadbalance
-        import /etc/coredns/custom/*.override
-        forward . /etc/resolv.conf
-    }
+  consul.server: |-
     consul:53 {
         errors
         cache 30
         forward . {{ consul_dns_target }}
     }
-    import /etc/coredns/custom/*.server

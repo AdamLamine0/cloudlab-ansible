@@ -104,29 +104,41 @@
   until: "'Ready' in k3s_node_status.stdout"
 
 # ---------------------------------------------------------------------------
-# 4. COREDNS — add the .consul forward zone (handoff §14)
+# 4. COREDNS — add the .consul forward zone (handoff §14, corrected 2026-08-21)
 # This is the piece that makes *.service.consul resolvable from inside any
 # pod, forwarding straight to Consul's own DNS interface on the nomad-style
 # VM for this environment (consul_dns_target — MUST be set correctly in
 # defaults/main.yml or via -e for whichever nomad box this kube talks to).
+#
+# IMPORTANT: this writes the "coredns-custom" ConfigMap, NOT "coredns"
+# directly. k3s's own addon controller owns and periodically reconciles the
+# "coredns" ConfigMap back to its stock template, silently discarding any
+# hand-added or templated zone written into it (see Problem #34 and its
+# full root-cause writeup in the master handoff, Part 16 step 8 — the zone
+# was found missing from the LIVE Corefile while a stale
+# objectset.rio.cattle.io/applied annotation still showed it, proving
+# reconciliation had already overwritten it after this task once ran
+# successfully). The stock Corefile already imports this exact extension
+# point (import /etc/coredns/custom/*.server), so writing the zone here
+# survives reconciliation instead of fighting it every time.
 # ---------------------------------------------------------------------------
-- name: Write CoreDNS ConfigMap manifest
+- name: Write CoreDNS custom ConfigMap manifest (coredns-custom, survives k3s reconciliation)
   ansible.builtin.template:
     src: coredns-configmap.yaml.j2
-    dest: /root/coredns-configmap.yaml
+    dest: /root/coredns-custom-configmap.yaml
     owner: root
     group: root
     mode: "0600"
 
-- name: Apply CoreDNS ConfigMap (declarative apply, not kubectl edit — see handoff §16 problem #24)
+- name: Apply CoreDNS custom ConfigMap (declarative apply, not kubectl edit — see handoff §16 problem #24)
   ansible.builtin.command: >
-    kubectl apply -f /root/coredns-configmap.yaml
+    kubectl apply -f /root/coredns-custom-configmap.yaml
     --kubeconfig=/etc/rancher/k3s/k3s.yaml
   register: coredns_apply
   changed_when: "'configured' in coredns_apply.stdout or 'created' in coredns_apply.stdout"
   notify: restart coredns
 
-- name: Flush handlers now so CoreDNS actually picks up the new Corefile
+- name: Flush handlers now so CoreDNS actually picks up the new custom zone
   ansible.builtin.meta: flush_handlers
 
 - name: Wait for CoreDNS pod to be ready again after restart

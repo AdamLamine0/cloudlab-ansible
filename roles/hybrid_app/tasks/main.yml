@@ -46,16 +46,6 @@
   connection: ssh
   register: vault_status
 
-- name: DEBUG vault_status
-  ansible.builtin.debug:
-    var: vault_status
-
-- name: DEBUG vault_status
-  ansible.builtin.debug:
-    var: vault_status
-
-  changed_when: false
-  failed_when: false
 
 - name: Fail clearly if Vault is sealed or unreachable
   ansible.builtin.fail:
