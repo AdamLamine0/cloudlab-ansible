@@ -1,0 +1,454 @@
+{
+  "id": "deleteProject001",
+  "name": "Delete Project (stop routing)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "delete-project",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "asked-delete",
+      "name": "Asked by the portal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "portalHookCred01",
+          "name": "Portal Webhook Token"
+        }
+      },
+      "webhookId": "delete-project-hook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// WHO is asking, and about WHAT. Both come from the portal, which\n// derived the username from a session it verified (HMAC over\n// username|expiry, capped by the Dex token). Nothing here re-derives\n// identity - and nothing here DECIDES ownership either. That decision\n// happens below, against the cluster.\n//\n// THE EMPTY CASE IS LOAD-BEARING, exactly as in the project list: a\n// blank username or a blank project must never be allowed to widen what\n// gets looked up. Both are refused outright rather than defaulted.\nconst raw = $input.first().json || {};\nconst body = raw.body || raw;\nconst username = String(body.username || '').trim().toLowerCase();\nconst project  = String(body.project  || '').trim().toLowerCase();\n\n// The same shapes used on the way in. A name that cannot be a namespace\n// cannot name anything we would delete.\nconst userOk    = /^[a-z][a-z0-9._-]{2,31}$/.test(username);\nconst projectOk = /^[a-z][a-z0-9-]{1,28}[a-z0-9]$/.test(project)\n                  && project.indexOf('--') === -1\n                  && !/^(kube-|proj-|tenant-)/.test(project);\n\nreturn [{ json: { username, project, usable: userOk && projectOk,\n  namespace: 'tenant-' + project } }];"
+      },
+      "id": "who-and-what?",
+      "name": "Who and what?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        300
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "usable",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.usable }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "real-request",
+      "name": "Is that a real request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "read-namespace",
+      "name": "Read the namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// THE OWNERSHIP CHECK. This is the whole reason the portal does not\n// decide: the portal knows a project name because a page rendered it,\n// which proves nothing about who owns it NOW. The answer here comes from\n// the namespace's own labels, read back from the API server.\n//\n// IT FAILS CLOSED, the same way `Is it ours to use?` does in the\n// provisioning workflow (Problem #147): unreadable, missing, or\n// unlabelled is NOT ours. Only an explicit owner match proceeds.\nconst who = $('Who and what?').first().json;\nlet labels = null, readable = false;\ntry {\n  const j = $('Read the namespace').first().json;\n  if (j && j.kind === 'Namespace' && j.metadata) {\n    readable = true;\n    labels = j.metadata.labels || {};\n  }\n} catch (e) { readable = false; labels = null; }\n\n// `tenant` is read as well as `owner` so namespaces created before\n// 2026-09-08 do not lock their owners out of deleting them.\nconst owner = labels ? (labels.owner || labels.tenant || '') : '';\nconst owned = readable && !!owner && owner === who.username;\n\nreturn [{ json: { username: who.username, project: who.project,\n  namespace: who.namespace, readable, owned } }];"
+      },
+      "id": "is-it-theirs?",
+      "name": "Is it theirs?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "owned",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.owned }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ours-to-delete",
+      "name": "Ours to delete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// REPORT WHAT THE API SERVER CONFIRMED, never what was attempted.\n//\n// A namespace DELETE returns 200 with the object in state Terminating -\n// the removal is asynchronous and can take many seconds while finalizers\n// run. 200 therefore means ACCEPTED, and that is what is claimed: the\n// project will disappear. Claiming \"gone\" at this instant would be a\n// state nothing has measured yet.\nconst who = $('Who and what?').first().json;\n\nfunction code(nodeName) {\n  try {\n    const r = $(nodeName).first().json;\n    return r.statusCode || (r.body && r.body.code) || 0;\n  } catch (e) { return 0; }\n}\n\nconst nsCode = code('Delete the namespace');\nconst jobCode = code('Purge the Nomad job');\n\nlet nomadNs = 'unknown';\ntry {\n  const r = $('Drop the Nomad namespace').first().json;\n  nomadNs = r.nomadNamespace || 'unknown';\n} catch (e) { nomadNs = 'unknown'; }\n\n// THE KUBERNETES NAMESPACE IS THE PROMISE. It is what the project list\n// is built from, so its removal is what makes the project disappear.\nconst nsGone = nsCode === 200 || nsCode === 202 || nsCode === 404;\nconst refused = nsCode === 403;\n\n// Nomad is reported separately and does NOT gate success. A Kubernetes\n// tenant has no Nomad job or namespace at all, so 404 there is normal.\nconst jobOk = jobCode === 200 || jobCode === 404;\nconst nomadOk = nomadNs === 'removed' || nomadNs === 'absent';\n\nlet deleted = nsGone && !refused;\nlet message;\nif (deleted && nomadOk) {\n  message = 'Le projet ' + who.project + ' a ete supprime. Son espace et tout '\n          + 'ce qu il contenait ont ete effaces.';\n} else if (deleted && !nomadOk) {\n  // Honest about the half that did not complete. The project vanishes\n  // from the list either way, but the NAME may stay unavailable until the\n  // Nomad namespace is cleared by hand - so say so rather than let the\n  // user discover it when they try to reuse it.\n  message = 'Le projet ' + who.project + ' a ete supprime, mais une partie de '\n          + 'son espace n a pas pu etre effacee. Ce nom pourrait rester '\n          + 'indisponible ; contactez un administrateur si vous voulez le '\n          + 'reutiliser.';\n} else if (refused) {\n  message = 'La suppression a ete refusee par le cluster. Rien ne peut etre '\n          + 'garanti comme supprime.';\n} else {\n  message = 'La suppression n a pas pu etre confirmee. Rien n a ete supprime '\n          + 'avec certitude.';\n}\n\nreturn [{ json: { owned: true, deleted, project: who.project,\n  namespaceStatus: nsCode, nomadJobStatus: jobCode, nomadNamespace: nomadNs,\n  nomadFullyCleared: nomadOk && jobOk, message } }];"
+      },
+      "id": "say-what-actually-happened",
+      "name": "Say what actually happened",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        300
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// NOT THEIRS, or not readable. Nothing has been called at this point -\n// the refusal happens BEFORE any delete, not after one is undone.\n//\n// The wording is deliberately identical to a project that does not\n// exist. Telling one user that another user's project is real would be\n// a disclosure in itself.\nconst who = $('Who and what?').first().json;\nreturn [{ json: { owned: false, deleted: false, project: who.project,\n  message: 'Ce projet est introuvable dans votre espace. Rien n a ete supprime.' } }];"
+      },
+      "id": "refuse-without-deleting",
+      "name": "Refuse without deleting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        460
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "answer-delete",
+      "name": "Answer the portal",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=http://192.168.1.51:4646/v1/job/starter?purge=true&namespace={{ $('Who and what?').first().json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "purge-the-nomad-job",
+      "name": "Purge the Nomad job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hand the namespace manager what it needs, and nothing else.\n//\n// The Nomad MANAGEMENT token is not here and must never be: namespace\n// deletion cannot be expressed as a scoped policy (Problem #138), so the\n// credential lives in one two-operation workflow that this reaches by ID.\n// That bounds accidental blast radius, not an attacker with n8n editor\n// access - say it that way and no stronger.\nconst who = $('Who and what?').first().json;\nreturn [{ json: { action: 'delete', name: who.namespace } }];"
+      },
+      "id": "ask-to-drop-nomad-ns",
+      "name": "Ask to drop the Nomad namespace",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        200
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "nomadNsCreator01",
+          "mode": "list",
+          "cachedResultName": "Nomad Namespace Manager (create and delete)"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "drop-the-nomad-namespace",
+      "name": "Drop the Nomad namespace",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        1560,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Who and what?').first().json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "delete-the-namespace",
+      "name": "Delete the namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Asked by the portal": {
+      "main": [
+        [
+          {
+            "node": "Who and what?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Who and what?": {
+      "main": [
+        [
+          {
+            "node": "Is that a real request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is that a real request?": {
+      "main": [
+        [
+          {
+            "node": "Read the namespace",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refuse without deleting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the namespace": {
+      "main": [
+        [
+          {
+            "node": "Is it theirs?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it theirs?": {
+      "main": [
+        [
+          {
+            "node": "Ours to delete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ours to delete?": {
+      "main": [
+        [
+          {
+            "node": "Purge the Nomad job",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refuse without deleting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Say what actually happened": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refuse without deleting": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Purge the Nomad job": {
+      "main": [
+        [
+          {
+            "node": "Ask to drop the Nomad namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask to drop the Nomad namespace": {
+      "main": [
+        [
+          {
+            "node": "Drop the Nomad namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop the Nomad namespace": {
+      "main": [
+        [
+          {
+            "node": "Delete the namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete the namespace": {
+      "main": [
+        [
+          {
+            "node": "Say what actually happened",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

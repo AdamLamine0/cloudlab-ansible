@@ -1,0 +1,176 @@
+{
+  "id": "nomadNsCreator01",
+  "name": "Nomad Namespace Manager (create and delete)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "nsTrigger0000001",
+      "name": "Called by the provisioning workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        220
+      ],
+      "notes": "Input: { namespace }. This workflow does exactly one thing."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://192.168.1.51:4646/v1/namespace",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ Name: $json.namespace, Description: 'CloudLab tenant namespace, created on demand by the signup portal' }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "nsCreate00000001",
+      "name": "Create the Nomad namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadMgmtCred01",
+          "name": "Nomad Management Token (namespace creation only)"
+        }
+      },
+      "notes": "The ONLY node in this lab holding the Nomad management token. Nomad's namespace apply is an UPSERT, so this is idempotent - no exists-check needed."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "isdelete01",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "delete"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "create-or-delete",
+      "name": "Create or delete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=http://192.168.1.51:4646/v1/namespace/{{ $json.name }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "delete-the-nomad-namespace",
+      "name": "Delete the Nomad namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        400
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadMgmtCred01",
+          "name": "Nomad Management Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Report what the API actually returned, not what was attempted.\n//\n// A 404 on delete means the namespace was never there - normal for a\n// Kubernetes-only tenant, which has no Nomad namespace at all. That is\n// 'absent', not 'removed', and not a failure.\n//\n// A 400 usually means the namespace still holds a non-terminal job. That\n// IS a failure: the caller stopped the job and it did not take.\nlet code = 0, body = '';\ntry {\n  const r = $input.first().json;\n  code = r.statusCode || 0;\n  body = JSON.stringify(r.body || r).slice(0, 200);\n} catch (e) { code = 0; }\n\nlet outcome;\nif (code === 200) outcome = 'removed';\nelse if (code === 404) outcome = 'absent';\nelse if (code === 403) outcome = 'refused';\nelse outcome = 'error';\n\nreturn [{ json: { nomadNamespace: outcome, statusCode: code, detail: body } }];"
+      },
+      "id": "say-what-nomad-did",
+      "name": "Say what Nomad did",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        400
+      ],
+      "alwaysOutputData": true
+    }
+  ],
+  "connections": {
+    "Called by the provisioning workflow": {
+      "main": [
+        [
+          {
+            "node": "Create or delete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create or delete?": {
+      "main": [
+        [
+          {
+            "node": "Delete the Nomad namespace",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create the Nomad namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete the Nomad namespace": {
+      "main": [
+        [
+          {
+            "node": "Say what Nomad did",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

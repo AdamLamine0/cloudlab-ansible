@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in to CloudLab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="bg">
+    <img class="bg__img" src="assets/bg-aurora.png" alt="" aria-hidden="true">
+    <div class="bg__scrim"></div>
+    <div class="bg__glow"></div>
+  </div>
+
+  <div class="lockup">
+    <img src="assets/tt-logo.png" alt="Tunisie Telecom — La vie est émotions">
+  </div>
+
+  <main class="auth auth--login">
+
+    <section class="pitch">
+      <h1 class="pitch__title">Back to<br><em>your cloud.</em></h1>
+      <p class="pitch__body">Everything you deployed is still running, in its own isolated space.</p>
+
+      <div class="badge-row">
+        <p class="badge"><span class="badge__dot"></span>3 projects running · all healthy</p>
+      </div>
+    </section>
+
+    <form class="card" action="dashboard.html" method="get">
+      <h2 class="card__title">Log in</h2>
+      <p class="card__sub card__sub--tight">Username and password — that is all CloudLab needs.</p>
+
+      <label class="field">
+        <span class="field__label">Username</span>
+        <input class="field__input" type="text" name="username" autocomplete="username" placeholder="amine.b" required>
+      </label>
+
+      <label class="field">
+        <span class="field__label">Password</span>
+        <input class="field__input" type="password" name="password" autocomplete="current-password" required>
+      </label>
+
+      <button class="btn btn--block" type="submit">Log in</button>
+      <p class="card__foot">No account yet? <a href="signup.html">Sign up</a></p>
+    </form>
+
+  </main>
+</div>
+</body>
+</html>

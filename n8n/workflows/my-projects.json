@@ -1,0 +1,421 @@
+{
+  "id": "myProjectsRead01",
+  "name": "My Projects (read-only)",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "my-projects",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "myProjHook000001",
+      "name": "Asked by the portal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "webhookId": "my-projects-hook",
+      "position": [
+        -260,
+        240
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "portalHookCred01",
+          "name": "Portal Webhook Token"
+        }
+      },
+      "notes": "Read-only. Same header auth as the provisioning webhook. The username is supplied by the portal, which derived it from a VERIFIED Dex-backed session - it is never taken from anything a browser sent."
+    },
+    {
+      "parameters": {
+        "jsCode": "// WHOSE PROJECTS? The portal supplies this, having derived it from a\n// session it verified (HMAC over username|expiry, expiry capped by the\n// Dex token). Nothing here re-derives identity; this workflow's job is\n// to answer for exactly the user it was asked about, and nobody else.\n//\n// THE EMPTY CASE IS LOAD-BEARING. A blank username would build the\n// selector `owner=` - and a namespace list WITHOUT a working selector\n// returns EVERY tenant's namespace (measured: 23 of them). So a missing\n// username is refused outright rather than allowed to widen the query.\nconst raw = $input.first().json || {};\nconst body = raw.body || raw;\nconst username = String(body.username || '').trim().toLowerCase();\n\n// Same shape FreeIPA usernames are validated to on the way in.\nconst usable = /^[a-z][a-z0-9._-]{2,31}$/.test(username);\n\nreturn [{ json: { username, usable,\n  // Pre-encoded so the selector cannot be broken by an unexpected\n  // character further down.\n  sel: encodeURIComponent(username) } }];"
+      },
+      "id": "myProjWho0000001",
+      "name": "Whose projects?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -80,
+        240
+      ],
+      "notes": "Refuses a blank or malformed username. An unfiltered namespace list would return every tenant's.",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "usableuser",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.usable }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "myProjGate000001",
+      "name": "Is that a real user?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        100,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces?labelSelector=owner%3D{{ $json.sel }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "myProjOwned00001",
+      "name": "Projects they own",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        300,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "THE SELECTOR IS THE OWNERSHIP CHECK. Kubernetes filters server-side, so no per-item decision here can be wrong. Without it this returns every namespace in the cluster."
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces?labelSelector=tenant%3D{{ $('Whose projects?').first().json.sel }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "myProjLegacy0001",
+      "name": "Their legacy projects",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "Namespaces created before 2026-09-08 carry only `tenant`. Reading both is what stops a legacy tenant losing sight of their own project."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the two selector results and answer. New namespaces carry BOTH\n// `owner` and `tenant` with the same value, so the two queries overlap -\n// dedupe by namespace name. Legacy ones match only the second.\n//\n// Nothing here decides ownership: every item arrived because the API\n// server matched it against a selector bound to this user. This code\n// only shapes the answer.\nconst who = $('Whose projects?').first().json;\n\nfunction items(nodeName) {\n  try {\n    const j = $(nodeName).first().json;\n    return (j && Array.isArray(j.items)) ? j.items : [];\n  } catch (e) { return []; }\n}\n\nconst byName = {};\nfor (const ns of items('Projects they own').concat(items('Their legacy projects'))) {\n  const m = ns.metadata || {};\n  if (!m.name) continue;\n  const labels = m.labels || {};\n  byName[m.name] = {\n    namespace: m.name,\n    // Legacy namespaces have no `project` label; their name minus the\n    // prefix is the closest honest answer.\n    project: labels.project || m.name.replace(/^tenant-/, ''),\n    url: 'http://' + m.name + '.apps.cloudlab.internal/',\n    created: m.creationTimestamp || null,\n    legacy: !labels.owner\n  };\n}\n\nconst projects = Object.keys(byName).sort().map(k => byName[k]);\n\n// ONE ITEM PER PROJECT from here on, so the next node can ask about each\n// one individually. A stop-routing delete leaves the namespace in place\n// (that is the whole scope of a delete), so a namespace existing no\n// longer means the project is reachable - the Ingress is what decides\n// that, and it has to be looked up per project.\n//\n// THE EMPTY CASE IS NOT AN EMPTY OUTPUT. n8n does not run a node with no\n// input, so returning [] here would kill the branch and the responder\n// would never fire - the portal would hang and then show a generic 503\n// while the execution reported success (Problem #135). A user with no\n// projects is a normal answer, so it travels as one explicit item.\nif (!projects.length) {\n  return [{ json: { username: who.username, empty: true } }];\n}\nreturn projects.map(p => ({ json: Object.assign({ username: who.username }, p) }));"
+      },
+      "id": "myProjMerge00001",
+      "name": "Merge and answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        160
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// A username we will not query for. Answering with an empty list is the\n// honest result: we are not saying they have no projects, we are saying\n// we were not asked a question we can answer safely.\nreturn [{ json: { username: '', count: 0, projects: [], refused: true } }];"
+      },
+      "id": "myProjRefuse0001",
+      "name": "Refuse without querying",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        340
+      ],
+      "notes": "Reached when the username is blank or malformed. No Kubernetes call is made at all.",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "id": "myProjRespond001",
+      "name": "Answer the portal",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        840,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "isempty",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.empty }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "any-projects",
+      "name": "Any projects at all?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/networking.k8s.io/v1/namespaces/{{ $json.namespace }}/ingresses/site",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "still-routing",
+      "name": "Is it still routing?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// PAIR each project with its own Ingress lookup.\n//\n// The HTTP node ran once per input item, so its outputs line up with the\n// projects by index. That assumption is CHECKED rather than trusted: if\n// the counts ever disagree, every project is reported as routing=null\n// instead of being paired up wrongly. Mislabelling a live project as\n// stopped is worse than admitting we do not know.\nconst projects = $('Merge and answer').all().map(i => i.json);\nconst items = $input.all();\nconst looks = items.map(i => i.json);\nconst aligned = projects.length === looks.length;\n\n// PREFER n8n's own pairing over positional order. Each item carries\n// pairedItem pointing back at the input index that produced it; using it\n// means a reorder cannot silently attach one project's answer to another\n// project's card. Index order is the fallback, and it is only trusted\n// when the counts match.\n//\n// Why this matters more than it looks: a mispairing does not error, it\n// renders \"Arrete\" on a project that is running perfectly well. That is\n// a false status claim, which is the thing #136 exists to prevent.\nconst byPair = {};\nitems.forEach((it, idx) => {\n  let p = it.pairedItem;\n  if (p && typeof p === 'object') p = Array.isArray(p) ? p[0] : p;\n  const src = (p && typeof p === 'object' && typeof p.item === 'number')\n    ? p.item : (typeof p === 'number' ? p : idx);\n  if (byPair[src] === undefined) byPair[src] = idx;\n});\n\nfunction routingOf(i) {\n  if (!aligned) return null;\n  const at = byPair[i] !== undefined ? byPair[i] : i;\n  const r = looks[at];\n  if (!r) return null;\n  const code = r.statusCode || 0;\n  if (code === 200) return true;    // the Ingress exists: the host is claimed\n  if (code === 404) return false;   // no Ingress: nothing routes to this name\n  return null;                      // 403, timeout, anything else: unknown\n}\n\nconst out = projects.map((p, i) => {\n  const routing = routingOf(i);\n  return {\n    namespace: p.namespace,\n    project: p.project,\n    created: p.created,\n    legacy: p.legacy,\n    routing: routing,\n    // THE URL IS ONLY SENT WHEN SOMETHING ANSWERS AT IT. A project whose\n    // Ingress is gone has no browsable address, and handing the portal a\n    // link that is known to 404 is worse than handing it none - the same\n    // rule the provisioner follows for siteUrl.\n    url: routing === false ? null\n       : 'http://' + p.namespace + '.apps.cloudlab.internal/'\n  };\n});\n\nreturn [{ json: { username: projects[0].username, count: out.length,\n  projects: out } }];"
+      },
+      "id": "collect-routing",
+      "name": "Collect the answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        240
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// No projects. A real, complete answer - not a failure, and not the\n// same thing as the refusal path, which means we would not ask.\nconst who = $('Whose projects?').first().json;\nreturn [{ json: { username: who.username, count: 0, projects: [] } }];"
+      },
+      "id": "answer-none",
+      "name": "Answer with none",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        80
+      ],
+      "alwaysOutputData": true
+    }
+  ],
+  "connections": {
+    "Asked by the portal": {
+      "main": [
+        [
+          {
+            "node": "Whose projects?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Whose projects?": {
+      "main": [
+        [
+          {
+            "node": "Is that a real user?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is that a real user?": {
+      "main": [
+        [
+          {
+            "node": "Projects they own",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refuse without querying",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Projects they own": {
+      "main": [
+        [
+          {
+            "node": "Their legacy projects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Their legacy projects": {
+      "main": [
+        [
+          {
+            "node": "Merge and answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge and answer": {
+      "main": [
+        [
+          {
+            "node": "Any projects at all?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refuse without querying": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any projects at all?": {
+      "main": [
+        [
+          {
+            "node": "Answer with none",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is it still routing?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it still routing?": {
+      "main": [
+        [
+          {
+            "node": "Collect the answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect the answer": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer with none": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

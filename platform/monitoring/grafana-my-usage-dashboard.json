@@ -1,0 +1,325 @@
+{
+  "uid": "cloudlab-my-usage",
+  "title": "My usage",
+  "tags": [
+    "cloudlab",
+    "per-user"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "editable": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 1,
+      "title": "",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Showing Kubernetes usage for **${__user.login}**, broken out per project.\n\nThis is a **default view, not enforced isolation** — it filters by the account you signed in with. It is not a security boundary: Grafana's Explore and query API remain available and are not scoped by this filter. A project counts as yours while it still has a Deployment: deleting a project removes that, so it drops out here even though its namespace is kept. Kubernetes and Nomad usage are both shown, each broken out per project."
+      }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Your projects",
+      "description": "Projects with a running workload on EITHER platform. Derived from the same series the CPU graphs use, so this count cannot disagree with the graphs beside it. Counting Kubernetes Deployments alone missed Nomad-only projects entirely. A project counts while its workload EXISTS, even if it is still building or unhealthy, so a freshly submitted project is never shown as zero.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 3
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(\n  (\n      sum by (namespace) (\n        rate(container_cpu_usage_seconds_total{container!=\"\",container!=\"POD\"}[5m])\n      )\n    or\n      sum by (namespace) (nomad_client_allocs_cpu_total_percent)\n    or\n      sum by (namespace) (kube_deployment_created)\n    or\n      sum by (namespace) (nomad_nomad_job_summary_running)\n  )\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n) or vector(0)",
+          "instant": true,
+          "legendFormat": "projects"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "CPU by project",
+      "description": "Container CPU, summed per project. Sourced from cAdvisor, joined to the namespace's owner label via kube_namespace_labels.",
+      "gridPos": {
+        "h": 9,
+        "w": 18,
+        "x": 6,
+        "y": 3
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (label_project) (\n  rate(container_cpu_usage_seconds_total{container!=\"\",container!=\"POD\"}[5m])\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n)",
+          "legendFormat": "{{label_project}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "No projects yet. Create one from the portal and it will appear here.",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Memory by project",
+      "description": "Container working-set memory, summed per project.",
+      "gridPos": {
+        "h": 9,
+        "w": 18,
+        "x": 6,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (label_project) (\n  container_memory_working_set_bytes{container!=\"\",container!=\"POD\"}\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n)",
+          "legendFormat": "{{label_project}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "No projects yet. Create one from the portal and it will appear here.",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "table",
+      "id": 5,
+      "title": "Your projects, right now",
+      "description": "One row per project with a running workload, Kubernetes or Nomad. Same source as the graphs. A project counts while its workload EXISTS, even if it is still building or unhealthy, so a freshly submitted project is never shown as zero.",
+      "gridPos": {
+        "h": 9,
+        "w": 6,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count by (label_project) (\n  (\n      sum by (namespace) (\n        rate(container_cpu_usage_seconds_total{container!=\"\",container!=\"POD\"}[5m])\n      )\n    or\n      sum by (namespace) (nomad_client_allocs_cpu_total_percent)\n    or\n      sum by (namespace) (kube_deployment_created)\n    or\n      sum by (namespace) (nomad_nomad_job_summary_running)\n  )\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n)",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "No projects yet."
+        },
+        "overrides": []
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            },
+            "renameByName": {
+              "label_project": "Project"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Nomad CPU by project",
+      "description": "Nomad allocation CPU, summed per project. Joined to the owner label on the NAMESPACE: the Nomad namespace and the Kubernetes namespace are the same string (tenant-PROJECT), which is the only identity a Nomad allocation carries - the job ID is the constant 'starter' and there is no Meta block.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (label_project) (\n  nomad_client_allocs_cpu_total_percent\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n)",
+          "legendFormat": "{{label_project}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "noValue": "Nothing running on Nomad. Projects deployed to Kubernetes appear above.",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Nomad memory by project",
+      "description": "Nomad allocation RSS, summed per project. Same namespace join as the CPU panel.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (label_project) (\n  nomad_client_allocs_memory_rss\n  * on (namespace) group_left(label_project)\n    kube_namespace_labels{label_owner=\"${__user.login}\"}\n)",
+          "legendFormat": "{{label_project}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "Nothing running on Nomad. Projects deployed to Kubernetes appear above.",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  }
+}

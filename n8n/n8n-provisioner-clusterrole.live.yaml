@@ -1,0 +1,75 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRole","metadata":{"annotations":{},"name":"n8n-provisioner"},"rules":[{"apiGroups":[""],"resources":["namespaces"],"verbs":["create","get","list","delete"]},{"apiGroups":[""],"resources":["resourcequotas"],"verbs":["create","get"]},{"apiGroups":["apps"],"resources":["deployments"],"verbs":["create","get","list","patch","delete"]},{"apiGroups":[""],"resources":["services"],"verbs":["create","get","patch","delete"]},{"apiGroups":["networking.k8s.io"],"resources":["ingresses"],"verbs":["create","get","patch","delete"]},{"apiGroups":["rbac.authorization.k8s.io"],"resources":["rolebindings"],"verbs":["create","get"]},{"apiGroups":["rbac.authorization.k8s.io"],"resourceNames":["tenant-full-access"],"resources":["clusterroles"],"verbs":["bind"]},{"apiGroups":["discovery.k8s.io"],"resources":["endpointslices"],"verbs":["create","get","patch"]}]}
+  name: n8n-provisioner
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - create
+  - get
+  - list
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - resourcequotas
+  verbs:
+  - create
+  - get
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - get
+  - patch
+  - delete
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - create
+  - get
+  - patch
+  - delete
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - create
+  - get
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - tenant-full-access
+  resources:
+  - clusterroles
+  verbs:
+  - bind
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - create
+  - get
+  - patch

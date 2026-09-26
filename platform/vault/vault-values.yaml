@@ -1,0 +1,17 @@
+server:
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+      listener "tcp" {
+        address     = "[::]:8200"
+        tls_disable = 1
+      }
+      storage "raft" {
+        path = "/vault/data"
+      }
+  dataStorage:
+    enabled: true
+    size: 1Gi
+ui:
+  enabled: true

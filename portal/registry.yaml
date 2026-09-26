@@ -1,0 +1,232 @@
+---
+# Internal container registry — for images built from tenants' own repos.
+#
+# NEVER EXPOSED EXTERNALLY. No Ingress, no NodePort. A ClusterIP is
+# routable from inside the cluster and from the node itself (via
+# kube-proxy), which is exactly the reach required and no more:
+#   - Kaniko build pods PUSH to it   (pod -> ClusterIP)
+#   - containerd on the node PULLS from it (node -> ClusterIP)
+# A NodePort would also have worked and was rejected: it publishes the
+# registry on the node's LAN address, which contradicts "in-cluster only".
+#
+# THE CLUSTER IP IS PINNED. containerd's /etc/rancher/k3s/registries.yaml
+# has to name this address, and a Service recreated without a pinned IP
+# would get a new one, silently breaking every image pull afterwards.
+# 10.43.200.50 was confirmed free before pinning.
+#
+# Image references therefore look like:
+#   10.43.200.50:5000/tenant-<user>/<repo>:<tag>
+# Ugly, but it is ONE name that both the build pod and the node resolve
+# without DNS games — the node cannot resolve *.svc.cluster.local.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: registry
+  labels:
+    name: registry
+    tier: platform
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: registry
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      # Deliberately modest: this shares the node's 19G root disk with
+      # every image layer and Kaniko's extracted filesystem. Disk is the
+      # binding constraint here, not memory.
+      storage: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  type: ClusterIP
+  clusterIP: 10.43.200.50    # PINNED — see the note above
+  selector:
+    app: registry
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+---
+# LAN-facing address, added 2026-09-01 for Nomad (Part 23 item 11).
+#
+# THIS DELIBERATELY WIDENS THE ORIGINAL "in-cluster only" CONSTRAINT.
+# Nomad runs on a separate VM (192.168.1.51) and cannot route to a k3s
+# ClusterIP, so running a Kaniko-built image there requires a LAN
+# address. Same klipper-lb mechanism as dex-external; port 5000 was
+# confirmed free on 192.168.1.50 before claiming it.
+#
+# ACCEPTED RISK, stated rather than hidden: there is NO authentication on
+# this registry, so anything on 192.168.1.0/24 can now pull from it and
+# push to it. Restricting it to .51 with a firewall rule on OPNsense is
+# NOT possible — .50 and .51 share an L2 segment, so that traffic never
+# reaches the gateway (verified: `ip route get 192.168.1.50` returns
+# `dev ens18` with no `via`). The control that WOULD work is htpasswd
+# auth on the registry itself; deferred as a scoped follow-up rather
+# than done mid-phase, because it also touches Kaniko's push path.
+#
+# The ClusterIP Service above is retained and unchanged: Kaniko still
+# pushes to 10.43.200.50:5000 and k3s still pulls from it. This Service
+# only adds a second door for Nomad.
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-external
+  namespace: registry
+spec:
+  type: LoadBalancer
+  selector:
+    app: registry
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: registry
+  labels:
+    app: registry
+spec:
+  replicas: 1
+  strategy:
+    # RWO volume: two pods must not mount the image store at once.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: registry
+          image: registry:2.8.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          env:
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: /var/lib/registry
+            # Allows an image to be deleted, so a bad build can be cleaned
+            # up rather than occupying the 4Gi permanently.
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: registry-data
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  podSelector:
+    matchLabels:
+      app: registry
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Kaniko build pods pushing finished images.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: build
+      ports:
+        - protocol: TCP
+          port: 5000
+    # containerd on the node pulling them. Image pulls originate from the
+    # NODE's network namespace, not from the tenant pod, so this is an
+    # ipBlock for the node address rather than a namespaceSelector for the
+    # tenant. Getting that wrong makes pulls fail with a timeout that
+    # looks like a registry outage.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.50/32
+      ports:
+        - protocol: TCP
+          port: 5000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 5000
+    # THE NOMAD HOST, and ONLY the Nomad host.
+    #
+    # This is the access restriction that OPNsense could not provide.
+    # A gateway firewall cannot filter .51 -> .50 because they share an
+    # L2 segment and the traffic never reaches the gateway. A
+    # NetworkPolicy CAN, because it is enforced at the destination POD,
+    # where the client's source address is still visible.
+    #
+    # Net effect: the registry now has a LAN-facing address, but only
+    # 192.168.1.51 may use it. Another host on 192.168.1.0/24 reaching
+    # 192.168.1.50:5000 gets refused here.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.51/32
+      ports:
+        - protocol: TCP
+          port: 5000
+  egress:
+    # DNS only. The registry never initiates anything else — it does not
+    # proxy or mirror upstream registries, deliberately.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

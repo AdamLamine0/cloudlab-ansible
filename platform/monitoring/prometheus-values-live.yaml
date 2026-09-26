@@ -1,0 +1,64 @@
+alertmanager:
+  enabled: true
+grafana:
+  adminPassword: <set at install time; see Vault>
+  enabled: true
+  extraSecretMounts:
+  - mountPath: /etc/grafana/secrets/oidc
+    name: oidc
+    readOnly: true
+    secretName: grafana-oidc
+  - mountPath: /etc/grafana/secrets/ca
+    name: ca
+    readOnly: true
+    secretName: grafana-dex-ca
+  grafana.ini:
+    auth.basic:
+      enabled: true
+    auth.generic_oauth:
+      allow_sign_up: true
+      api_url: https://dex.dex.svc.cluster.local:5554/dex/userinfo
+      auth_url: https://dex.dex.svc.cluster.local:5554/dex/auth
+      client_id: grafana
+      client_secret: $__file{/etc/grafana/secrets/oidc/client_secret}
+      enabled: true
+      login_attribute_path: preferred_username
+      name: CloudLab
+      role_attribute_path: '''Viewer'''
+      scopes: openid profile email groups
+      tls_client_ca: /etc/grafana/secrets/ca/freeipa-ca.crt
+      token_url: https://dex.dex.svc.cluster.local:5554/dex/token
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/my-usage.json
+    server:
+      root_url: http://grafana.cloudlab.internal
+  service:
+    type: ClusterIP
+kube-state-metrics:
+  metricLabelsAllowlist:
+  - namespaces=[owner,project,tenant]
+prometheus:
+  prometheusSpec:
+    additionalScrapeConfigs:
+    - job_name: nomad
+      metrics_path: /v1/metrics
+      params:
+        format:
+        - prometheus
+      static_configs:
+      - targets:
+        - 192.168.1.51:4646
+    - bearer_token: 3fdd51f4-53b5-ffdf-b74b-1bec59adc358
+      job_name: consul
+      metrics_path: /v1/agent/metrics
+      params:
+        format:
+        - prometheus
+      static_configs:
+      - targets:
+        - 192.168.1.51:8500
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+    retention: 7d

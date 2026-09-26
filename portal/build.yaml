@@ -1,0 +1,111 @@
+---
+# Build namespace — where a STRANGER'S Dockerfile is executed.
+#
+# This is the most dangerous thing in the lab, and it shares NOTHING with
+# the existing CI/CD (Parts 16-18). That CI/CD runs on a self-hosted
+# runner on `auto` holding the ansible-vault password and the jump-host
+# password, and Part 17 says plainly why that is acceptable: "the runner
+# already IS the lab's trust boundary" — it only ever executes OUR code
+# from a private repo. This namespace executes code nobody reviewed.
+# Reusing any of those credentials would hand an unreviewed RUN line the
+# keys to every machine here.
+#
+# ZERO SHARED CREDENTIALS, as a checked constraint: no Vault path, no
+# ansible-vault password, no jump-host password, no GitHub PAT, and no
+# ServiceAccount token are mounted in this namespace. Verified after
+# deploy, not assumed.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: build
+  labels:
+    name: build
+    tier: platform
+---
+# Kaniko needs NO Kubernetes API access at all: it clones, builds, pushes.
+# The token is therefore not mounted, so a malicious Dockerfile cannot
+# reach the API even if it finds the service address.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: builder
+  namespace: build
+automountServiceAccountToken: false
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builder
+  namespace: build
+spec:
+  podSelector:
+    matchLabels:
+      app: kaniko-build
+  policyTypes: ["Ingress", "Egress"]
+  # Nothing may connect TO a build pod. It is not a service.
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The internal registry, to push the finished image.
+    #
+    # This MUST be a namespaceSelector, not an ipBlock of the Service IP.
+    # Egress policy is evaluated AFTER DNAT, so the destination is the
+    # registry POD's address (10.42.x.x), not the Service's 10.43.200.50.
+    # An ipBlock naming the Service IP therefore matches nothing, and the
+    # RFC1918 exclusion below then blocks the pod address — which
+    # presents as "connection refused" on push, looking like the registry
+    # is down. See Problem #119.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: registry
+      ports:
+        - protocol: TCP
+          port: 5000
+    # GitHub (clone) and whatever package registries the Dockerfile
+    # needs — npm, PyPI, crates.io, Go modules, Docker Hub for base
+    # images. These cannot be enumerated by IP, so this is public
+    # internet on 443/80 with EVERY private range excluded.
+    #
+    # That exclusion is the actual control: FreeIPA (192.168.1.152),
+    # Vault and Dex (10.43.x), every tenant namespace (10.42.x), the
+    # signup namespace, and `auto` where the existing CI/CD runner lives
+    # are all inside those ranges and therefore unreachable from here.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+---
+# Hard ceiling on the whole namespace, independent of any single Job's
+# limits. A caller that somehow queued many builds still cannot exhaust
+# the node — memory is the scarce resource here (the node runs at ~51%
+# before any build starts).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: build-quota
+  namespace: build
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    pods: "3"

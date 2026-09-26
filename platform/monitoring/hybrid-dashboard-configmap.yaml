@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hybrid-overview-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  hybrid-overview.json: |
+    {
+      "title": "Hybrid Platform Overview (K3s + Nomad/Consul)",
+      "uid": "hybrid-overview",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Nomad Control Plane",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "targets": [{ "expr": "up{job=\"nomad\"}", "datasource": { "type": "prometheus" } }],
+          "fieldConfig": { "defaults": { "mappings": [
+            {"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}
+          ]}}
+        },
+        {
+          "type": "stat",
+          "title": "Consul Control Plane",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "targets": [{ "expr": "up{job=\"consul\"}", "datasource": { "type": "prometheus" } }],
+          "fieldConfig": { "defaults": { "mappings": [
+            {"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}
+          ]}}
+        },
+        {
+          "type": "stat",
+          "title": "K3s API Server",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "targets": [{ "expr": "up{job=\"apiserver\"}", "datasource": { "type": "prometheus" } }],
+          "fieldConfig": { "defaults": { "mappings": [
+            {"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}
+          ]}}
+        },
+        {
+          "type": "stat",
+          "title": "CoreDNS",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "targets": [{ "expr": "up{job=\"coredns\"}", "datasource": { "type": "prometheus" } }],
+          "fieldConfig": { "defaults": { "mappings": [
+            {"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}
+          ]}}
+        },
+        {
+          "type": "timeseries",
+          "title": "Nomad Client Allocations (running)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "targets": [{ "expr": "nomad_client_allocations_running", "datasource": { "type": "prometheus" } }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Nomad Raft Leader Log Age (presence = leader)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "targets": [{ "expr": "nomad_raft_leader_oldestLogAge", "datasource": { "type": "prometheus" } }]
+        },
+        {
+          "type": "timeseries",
+          "title": "K3s Node CPU Usage",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "targets": [{ "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "datasource": { "type": "prometheus" } }]
+        },
+        {
+          "type": "timeseries",
+          "title": "K3s Node Memory Usage %",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "targets": [{ "expr": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))", "datasource": { "type": "prometheus" } }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Running Pods per Namespace (K3s)",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+          "targets": [{ "expr": "sum by (namespace) (kube_pod_status_phase{phase=\"Running\"})", "datasource": { "type": "prometheus" } }]
+        }
+      ]
+    }

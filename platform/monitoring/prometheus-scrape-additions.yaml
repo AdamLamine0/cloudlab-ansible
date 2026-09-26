@@ -1,0 +1,29 @@
+grafana:
+  enabled: true
+  adminPassword: "<set at install time; see Vault>"
+  service:
+    type: ClusterIP
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+    additionalScrapeConfigs:
+      - job_name: 'nomad'
+        metrics_path: '/v1/metrics'
+        params:
+          format: ['prometheus']
+        static_configs:
+          - targets: ['192.168.1.51:4646']
+      - job_name: 'consul'
+        metrics_path: '/v1/agent/metrics'
+        params:
+          format: ['prometheus']
+        static_configs:
+          - targets: ['192.168.1.51:8500']
+
+alertmanager:
+  enabled: true

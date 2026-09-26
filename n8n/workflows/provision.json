@@ -1,0 +1,3402 @@
+{
+  "id": "provisionTenant01",
+  "name": "Provision tenant project",
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "new-project",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook0000000001",
+      "name": "Submission from portal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ],
+      "webhookId": "provision-new-project",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "portalHookCred01",
+          "name": "Portal Webhook Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and normalise the submission BEFORE anything external is\n// called. Nothing downstream trusts raw input.\nconst body = $input.first().json.body || {};\n\nconst username = String(body.username || '').trim().toLowerCase();\nconst email = String(body.email || '').trim();\nconst description = String(body.description || '').trim();\nconst repoUrl = String(body.repoUrl || '').trim();\n\nif (!/^[a-z][a-z0-9._-]{2,31}$/.test(username)) {\n  throw new Error('invalid username: ' + username);\n}\nif (description.length < 10) {\n  throw new Error('description too short');\n}\n\n// --- THE PROJECT NAME (Phase 1: accepted, not yet user-facing) --------\n// A tenant is becoming a PROJECT rather than a person. For now `project`\n// defaults to the username, so the namespace is byte-identical to what\n// every existing tenant already has and nothing observable changes.\n//\n// Validated to a DNS-1123 label here, at the boundary, because it will\n// become a hostname. Anything that does not fit falls back to the\n// username rather than failing the submission - the portal will validate\n// properly once the field is user-facing (Phase 3).\nconst RESERVED = [\n  'default', 'kube-system', 'kube-public', 'kube-node-lease',\n  'build', 'registry', 'monitoring', 'signup', 'n8n', 'dex', 'vault',\n  'user1', 'user2',\n  'www', 'api', 'admin', 'apps', 'auth', 'login', 'portal', 'mail',\n  'ns1', 'static', 'cdn', 'root', 'system'\n];\nfunction usableProject(name) {\n  if (!/^[a-z][a-z0-9-]{1,28}[a-z0-9]$/.test(name)) return false;\n  if (name.indexOf('--') !== -1) return false;\n  if (RESERVED.indexOf(name) !== -1) return false;\n  // Prefixes that belong to the platform, not to a user.\n  if (/^(kube-|proj-|tenant-)/.test(name)) return false;\n  return true;\n}\nconst rawProject = String(body.project || '').trim().toLowerCase();\n// DNS-1123: FreeIPA uids may contain . and _, which are legal there and\n// illegal in a namespace name, so they are mapped out rather than\n// rejected by the API later.\nconst fromUser = username.replace(/[^a-z0-9]+/g, '-')\n  .replace(/-+/g, '-').replace(/-$/, '').slice(0, 30);\nconst project = usableProject(rawProject) ? rawProject : fromUser;\nconst projectFromUser = project === fromUser;\n\nconst ns = ('tenant-' + project).replace(/-+/g, '-').replace(/-$/, '').slice(0, 63);\n\n// Only the owner/repo shape is accepted. Anything else is treated as\n// \"no repo\" rather than passed to GitHub - a bad URL must degrade the\n// analysis, never fail the submission.\nconst m = repoUrl.match(/^https:\\/\\/github\\.com\\/([A-Za-z0-9_.-]+)\\/([A-Za-z0-9_.-]+?)(?:\\.git)?\\/?$/);\nconst hasRepo = Boolean(m);\nconst owner = hasRepo ? m[1] : '';\nconst repo  = hasRepo ? m[2] : '';\n\nconst prompt = description.slice(0, 800);\n\n// THE USER'S OWN PLATFORM CHOICE, from the radio on /new-project.\n// Whitelisted here, at the boundary, exactly like the classifier's\n// answer is: the request is external input and must not be able to name\n// an arbitrary platform. Anything unrecognised becomes '' and is\n// treated as 'no choice made', which routes to the classifier.\n//\n// 'both' is NOT an explicit platform. Its label is 'Je ne sais pas,\n// aidez-moi a choisir' - it is the opt-IN to classification.\nconst KINDS = ['kubernetes', 'nomad', 'both'];\nconst rawKind = String(body.kind || '').trim().toLowerCase();\nconst requestedKind = KINDS.includes(rawKind) ? rawKind : '';\nconst userDecided = requestedKind === 'kubernetes' || requestedKind === 'nomad';\n\nreturn [{ json: { username, email, description, namespace: ns, prompt,\n  project, projectFromUser,\n  requestedKind, userDecided,\n  repoUrl, hasRepo, owner, repo } }];"
+      },
+      "id": "validate00000001",
+      "name": "Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.groqBody }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "groqclassify0001",
+      "name": "Classify with Groq",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -20,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "groqApiCred0001",
+          "name": "Groq API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// THE MODEL PICKS FROM A FIXED MENU. It cannot invent an action, name a\n// namespace, or influence anything except which of three known values\n// comes out of here. Anything unrecognised - a refusal, an explanation,\n// an outage, a hallucinated option - becomes 'both', the safe default,\n// because that asks a human to decide.\nconst ALLOWED = ['kubernetes', 'nomad', 'both'];\n\nconst prev = $('Analyse repo').first().json;\n\n// WHO DECIDED, and it is reported to the user rather than blurred:\n//   'user'       - they picked Kubernetes or Nomad; Groq was NEVER called\n//   'classifier' - they asked for help and Groq gave a usable answer\n//   'default'    - Groq was unusable (refusal, outage, nonsense)\n//\n// An explicit choice is honoured absolutely. This node used to derive\n// `choice` from Groq's reply alone, which silently overrode every\n// selection the user made - the radio had no effect on anything.\nlet choice, decidedBy, classifierUnsure = false;\nlet raw = '';\n\nif (prev.userDecided) {\n  choice = prev.requestedKind;\n  decidedBy = 'user';\n} else {\n  try { raw = $input.first().json?.choices?.[0]?.message?.content ?? ''; } catch (e) { raw = ''; }\n  const cleaned = String(raw).trim().toLowerCase().replace(/[^a-z]/g, '');\n  if (cleaned === 'kubernetes' || cleaned === 'nomad') {\n    choice = cleaned;\n    decidedBy = 'classifier';\n  } else if (cleaned === 'both') {\n    // Groq genuinely could not separate them. Fall back to Kubernetes\n    // and SAY SO. Kubernetes is the right default: it is the only\n    // platform with a browsable tenant URL (Part 23 item 12), so an\n    // uncertain answer should land where the user gets a working link.\n    choice = 'kubernetes';\n    decidedBy = 'classifier';\n    classifierUnsure = true;\n  } else {\n    // A refusal, an outage, or a hallucinated option.\n    choice = 'kubernetes';\n    decidedBy = 'default';\n    classifierUnsure = true;\n  }\n}\nconst ns = prev.namespace;\n\n// Request bodies are built HERE, as strings, and referenced downstream as\n// a single flat expression. They cannot be inlined into the HTTP nodes:\n// an n8n expression containing an object literal breaks its template\n// parser on the nested '}}' (see Problem #116).\nconst bodyNamespace = JSON.stringify({\n  apiVersion: 'v1', kind: 'Namespace',\n  // OWNERSHIP, recorded on the object itself. `tenant` is kept for every\n  // namespace created before this change; `owner` is what the ownership\n  // check and the future \"my projects\" list read. Both are written now\n  // so a dual-read never has to guess.\n  metadata: { name: ns, labels: { 'provisioned-by': 'n8n',\n    tenant: prev.username, 'owner': prev.username,\n    'project': prev.project } }\n});\nconst bodyQuota = JSON.stringify({\n  apiVersion: 'v1', kind: 'ResourceQuota',\n  metadata: { name: ns + '-quota' },\n  spec: { hard: { cpu: prev.quota.cpu, memory: prev.quota.memory } }\n});\nconst bodyBinding = JSON.stringify({\n  apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'RoleBinding',\n  metadata: { name: prev.username + '-binding' },\n  roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: 'tenant-full-access' },\n  subjects: [{ apiGroup: 'rbac.authorization.k8s.io', kind: 'User', name: prev.email }]\n});\nconst bodyDeployment = JSON.stringify({\n  apiVersion: 'apps/v1', kind: 'Deployment',\n  metadata: { name: 'starter', labels: { app: 'starter' } },\n  spec: { replicas: 1, selector: { matchLabels: { app: 'starter' } },\n    template: { metadata: { labels: { app: 'starter' } },\n      spec: { containers: [{ name: 'starter', image: 'nginx:alpine',\n        ports: [{ containerPort: 80 }],\n        resources: { requests: { cpu: '50m', memory: '64Mi' },\n                     limits: { cpu: '200m', memory: '256Mi' } } }] } } }\n});\n\nreturn [{ json: { ...prev, choice, classifierRaw: String(raw).slice(0,120),\n  decidedBy, classifierUnsure,\n  classifierUsed: decidedBy === 'classifier',\n  needsK8s: choice === 'kubernetes' || choice === 'both',\n  bodyNamespace, bodyQuota, bodyBinding, bodyDeployment } }];"
+      },
+      "id": "pickmenu00000001",
+      "name": "Pick from fixed menu",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://kubernetes.default.svc/api/v1/namespaces",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Pick from fixed menu').first().json.bodyNamespace }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "createns00000001",
+      "name": "Create namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Pick from fixed menu').first().json.namespace }}/resourcequotas",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Pick from fixed menu').first().json.bodyQuota }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "createquota00001",
+      "name": "Create quota",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        640,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/namespaces/{{ $('Pick from fixed menu').first().json.namespace }}/rolebindings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Pick from fixed menu').first().json.bodyBinding }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "createbinding001",
+      "name": "Bind tenant identity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needsk8s01",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Pick from fixed menu').first().json.needsK8s }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ifneedsk8s000001",
+      "name": "Needs a k8s workload?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/apps/v1/namespaces/{{ $('Pick from fixed menu').first().json.namespace }}/deployments/starter?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "options": {
+          "timeout": 20000
+        },
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Pick from fixed menu').first().json.bodyDeployment }}"
+      },
+      "id": "createdeploy0001",
+      "name": "Create starter deployment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1520,
+        480
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single place that decides what the portal is told. Every k8s node\n// uses onError:continueRegularOutput, so one failure does not abort the\n// run silently - the outcome is assembled here instead.\nconst d = $(\"Pick from fixed menu\").first().json;\n\n// Kubernetes returns EITHER the created object (kind: Namespace,\n// ResourceQuota, ...) OR a Status object on failure\n// (kind: \"Status\", status: \"Failure\", reason: ...).\n// An earlier version tested  and reported every\n// SUCCESS as a failure, because a created Namespace carries both a\n// kind AND a status ({phase: Active}). Test the kind, not the\n// presence of a status field.\nfunction ok(nodeName) {\n  try {\n    const j = $(nodeName).first().json;\n    if (!j) return false;\n    // Success: Kubernetes returns the created object. Note a Namespace\n    // carries BOTH a kind and a status ({phase: Active}), so testing\n    // `!status` reported every success as a failure - the bug this\n    // replaced.\n    if (j.kind && j.kind !== \"Status\") return true;\n    // Re-submission is normal, and a 409 AlreadyExists means the desired\n    // state is already there. n8n surfaces that either as the k8s Status\n    // body or as its own error object depending on the node, so match on\n    // the substance rather than one shape.\n    const s = JSON.stringify(j);\n    if (s.indexOf(\"AlreadyExists\") !== -1) return true;\n    if (s.indexOf(\"409\") !== -1) return true;\n    return false;\n  } catch (e) { return false; }\n}\n\n// Which deployment path actually ran? Exactly one of these nodes\n// executed, so ok() returning false for the other is expected, not a\n// failure - hence checking canBuild rather than OR-ing the two.\n// Since Phase 2, the platform choice decides WHERE and the Dockerfile\n// fact decides WHAT runs there. Both platforms can now run a built\n// image, so \"nomad\" no longer has to be overridden to avoid an empty\n// namespace - it gets the tenant's real image too.\n// NEW TENANT OR A RETURNING ONE? `Create namespace` is still create-only,\n// so its response answers this with no extra call: the created object\n// means new, a 409 AlreadyExists means the tenant was already there and\n// the Deployment/Service/Ingress were UPDATED rather than created.\n// Reported because a run that silently changed nothing used to be\n// indistinguishable from one that provisioned a tenant (the 2026-09-05\n// bug), and 'success' should never again be ambiguous about which\n// happened.\nlet tenantState = 'created';\ntry {\n  const nsRaw = JSON.stringify($('Create namespace').first().json || {});\n  if (nsRaw.indexOf('AlreadyExists') !== -1) tenantState = 'updated';\n} catch (e) { tenantState = 'unknown'; }\n\nconst isNomad = d.choice === 'nomad';\nconst wantedBuild = Boolean(d.canBuild) && !isNomad;\n\n// THE BUILD MAY HAVE BEEN REFUSED BEFORE IT EVER STARTED.\n// The build namespace's ResourceQuota caps concurrency at TWO Kaniko\n// pods (requests.memory 1Gi, 512Mi each). A third simultaneous\n// submission has its Job rejected by the admission controller with a\n// 403 'exceeded quota'.\n//\n// That rejection used to be reported honestly while the built Deployment\n// was created anyway, pointing at an image tag nothing would ever push:\n// a permanent ImagePullBackOff - and, once tenant URLs existed, a link\n// GUARANTEED never to work. 'Build accepted?' now routes a refused build\n// to the same starter path an unbuildable repo takes, so the tenant gets\n// a real working site plus an explicit, true statement that their own\n// image was not built this time.\n// NOT `ok('Start image build')`. The Job's CREATION always succeeds -\n// the quota refuses the POD, asynchronously, after the 201. Ask the\n// Job whether it ever got a pod instead.\nlet podStarted = false;\ntry { podStarted = Boolean($('Did a build pod start?').first().json.buildPodStarted); }\ncatch (e) { podStarted = false; }\nconst buildRejected = wantedBuild && !podStarted;\nconst builtPath = wantedBuild && !buildRejected;\nconst steps = {\n  namespace: ok(\"Create namespace\"),\n  quota: ok(\"Create quota\"),\n  binding: ok(\"Bind tenant identity\"),\n  // ALWAYS the starter now. The built image is no longer deployed\n  // before this response: it is polled for and patched into the SAME\n  // Deployment afterwards. Asking about \"Deploy built image\" here would\n  // read false against a node that no longer exists, and the tenant\n  // would be told their deployment failed when it had not.\n  deployment: d.needsK8s ? ok(\"Create starter deployment\") : null\n};\n\n// Build reporting. The workflow deliberately does NOT wait for the build\n// to finish: builds take minutes and the portal times out at 60s. The\n// Deployment is created immediately pointing at the image the build will\n// push, and Kubernetes retries the pull until it appears. So \"deployed\"\n// here means \"the Deployment exists\", and buildState says whether the\n// image is ready yet.\nlet buildStarted = false, buildState = null;\nif (builtPath) {\n  buildStarted = true;\n  try {\n    const j = $(\"Check build status\").first().json;\n    if (j && j.status) {\n      if (j.status.succeeded) buildState = \"succeeded\";\n      else if (j.status.failed) buildState = \"failed\";\n      else buildState = \"building\";\n    }\n  } catch (e) { buildState = \"unknown\"; }\n}\n\n// --- the tenant's browsable address ------------------------------------\n// Reported ONLY when an Ingress was actually created. A URL that was\n// requested but whose Ingress failed must not be shown to the user as if\n// it worked - that is the same class of lie as reporting a placeholder\n// as their own image.\nconst site = ok('Create ingress') && ok('Create service');\nlet siteUrl = null, siteHost = null, sitePortSource = null;\nif (site) {\n  try {\n    const s = $('Decide site').first().json;\n    siteUrl = s.siteUrl; siteHost = s.siteHost; sitePortSource = s.portSource;\n  } catch (e) { /* Decide site did not run: leave null */ }\n}\n// A built image's Deployment is created BEFORE the build finishes and\n// sits in ImagePullBackOff until the image is pushed, so the link is\n// live only once the build succeeded. The starter is up immediately.\nconst siteReady = site && (!builtPath || buildState === 'succeeded');\n\nconst provisioned = steps.namespace && steps.quota && steps.binding\n  && (steps.deployment === null || steps.deployment === true);\n\n// Nomad IS automated now, for the `nomad` choice only. `both` is\n// deliberately untouched in this pass: it remains a human-review\n// fallback, not a dual-deployment feature.\nconst nomadAttempted = isNomad;\n// On the Nomad side too: a buildable repo beats the placeholder. Same\n// fact-before-opinion ordering as the Kubernetes path.\nconst nomadBuilt = nomadAttempted && Boolean(d.canBuild);\nlet nomadJob = null, nomadNamespaceMissing = false;\nif (nomadAttempted) {\n  try {\n    const j = $(nomadBuilt ? \"Submit Nomad job (built image)\"\n                           : \"Submit Nomad job\").first().json;\n    if (j && j.EvalID) nomadJob = \"submitted\";\n    else {\n      const s = JSON.stringify(j);\n      // Nomad answers HTTP 500 with \"nonexistent namespace\" - NOT 403 -\n      // when the tenant namespace has not been created. Verified against\n      // the live API rather than assumed, because guessing 403 here\n      // reported a real, expected condition as a generic failure.\n      if (s.indexOf(\"nonexistent namespace\") !== -1 ||\n          s.indexOf(\"Permission denied\") !== -1) {\n        nomadNamespaceMissing = true; nomadJob = \"blocked\";\n      } else nomadJob = \"failed\";\n    }\n  } catch (e) { nomadJob = \"failed\"; }\n}\n// `choice` can no longer BE 'both': an explicit choice is honoured, and\n// an uncertain classifier now resolves to Kubernetes with a note rather\n// than parking the request for a human. nomadPending is retired and\n// pinned false so any old reader sees a definite answer, not a stale one.\n// NAME COLLISION. Phase 1 cannot be reached by a normal submission\n// (project defaults to the username), but the path is real and reported\n// so the refusal is honest the moment names become user-chosen.\nlet nameTaken = false, ownerUnknown = false;\ntry {\n  const o = $('Is it ours to use?').first().json;\n  nameTaken = Boolean(o.nameTaken);\n  ownerUnknown = Boolean(o.ownerUnknown);\n} catch (e) { /* the check did not run */ }\n\n// A refused name did not create OR update anything. Reporting\n// 'updated' here - which the namespace 409 would otherwise imply - would\n// claim work that never happened, on the one path where the user most\n// needs to be told plainly that nothing was done.\nif (nameTaken) tenantState = 'refused';\n\nconst nomadPending = false;\n\n// --- the Nomad tenant's browsable address -----------------------------\n// Kubernetes' Traefik fronts a Nomad job on another host through a\n// selector-less Service + a hand-built EndpointSlice carrying the\n// allocation's REAL host:port. Same honesty rule as the Kubernetes path:\n// a URL is reported only when every object came back real AND a genuine\n// port was read. A link that is guaranteed to 502 is worse than none.\nlet nomadSiteUrl = null, nomadSiteHost = null, nomadSiteReady = false;\nlet nomadPort = null, nomadAllocStatus = null;\nif (nomadAttempted) {\n  let addr = null;\n  try { addr = $('Decide Nomad site').first().json; } catch (e) { addr = null; }\n  const wired = ok('Create nomad service') && ok('Create nomad endpoints')\n                && ok('Create nomad ingress');\n  if (addr) {\n    nomadPort = addr.nomadPort || null;\n    nomadAllocStatus = addr.allocStatus || null;\n    // BOTH halves required: the objects exist AND a real port was read.\n    // haveAddr is false when Nomad had not placed the allocation yet, in\n    // which case there is genuinely nothing to point at.\n    if (wired && addr.haveAddr) {\n      nomadSiteUrl = addr.siteUrl; nomadSiteHost = addr.siteHost;\n      // Ready only once the allocation is actually running. A built\n      // image's job sits pending until the image is pushed, exactly like\n      // the Kubernetes ImagePullBackOff case.\n      nomadSiteReady = Boolean(addr.allocRunning);\n    }\n  }\n}\n\n// ONE pair of fields for the portal whichever platform ran, so the page\n// needs no per-platform branch and cannot show a Kubernetes URL for a\n// Nomad tenant or vice versa.\nconst finalSiteUrl = nomadAttempted ? nomadSiteUrl : siteUrl;\nconst finalSiteHost = nomadAttempted ? nomadSiteHost : siteHost;\nconst finalSiteReady = nomadAttempted ? nomadSiteReady : siteReady;\n\nreturn [{ json: {\n  provisioned, username: d.username, namespace: d.namespace,\n  choice: d.choice, classifierUsed: d.classifierUsed, steps, nomadPending,\n  // Who actually decided the platform, so the portal can say so instead\n  // of implying the user's selection was applied when it was not.\n  // 'created' = new tenant, 'updated' = existing tenant re-provisioned.\n  tenantState,\n  // Refused: the name belongs to someone else, or ownership could not\n  // be established. Either way nothing was deployed.\n  nameTaken, ownerUnknown,\n  project: d.project || null,\n  decidedBy: d.decidedBy, requestedKind: d.requestedKind || null,\n  classifierUnsure: Boolean(d.classifierUnsure),\n  // Repo analysis is reported honestly: repoAnalysed says whether the\n  // link was actually READ, not merely supplied. A rate limit or a\n  // private repo shows up here as false with the default quota.\n  repoProvided: Boolean(d.hasRepo), repoAnalysed: Boolean(d.repoAnalysed),\n  quotaTier: d.quotaTier, quota: d.quota, readmeChars: d.readmeChars || 0,\n  languages: Object.keys(d.languages || {}).slice(0, 6),\n  hasDockerfile: Boolean(d.hasDockerfile), hasCompose: Boolean(d.hasCompose),\n  // \"built\" vs \"fallback\" stated plainly - never implying a real image\n  // was produced when the starter placeholder was deployed instead.\n  deployPath: builtPath ? \"built\"\n    : (d.needsK8s ? \"fallback\"\n    : (nomadAttempted ? (nomadBuilt ? \"nomad-built\" : \"nomad\") : \"none\")),\n  nomadNamespace: nomadAttempted ? d.nomadNamespace : null,\n  nomadJob, nomadNamespaceMissing,\n  // \"we ran YOUR image\" is never conflated with \"we ran a placeholder\".\n  nomadPath: nomadAttempted ? (nomadBuilt ? \"built\" : \"starter\") : null,\n  nomadImage: nomadBuilt ? d.nomadImageRef : null,\n  nomadBuildStarted: nomadBuilt ? ok(\"Start image build for Nomad\") : null,\n  buildStarted, buildState, image: builtPath ? d.imageRef : null,\n  // Said plainly rather than folded into a generic failure: the platform\n  // was busy, the tenant's own image was not built, a working placeholder\n  // site was deployed instead.\n  buildRejected,\n  // BOTH platforms have a browsable URL now. The Nomad one is bridged\n  // through a selector-less Service + EndpointSlice carrying the\n  // allocation's real host:port (added 2026-09-05); the correction to\n  // the old 'Kubernetes tenants only' comment is deliberate.\n  //\n  // STALENESS, stated because it is real: the Nomad port is a SNAPSHOT.\n  // Nothing watches Nomad, so if that allocation is later rescheduled it\n  // returns on a new random port and this URL 502s until the tenant\n  // resubmits. Part 23 item 17.\n  siteUrl: finalSiteUrl, siteHost: finalSiteHost, siteReady: finalSiteReady,\n  sitePortSource,\n  // The Kubernetes-path values are kept under their own names so a\n  // reader can still tell which path produced what.\n  k8sSiteUrl: siteUrl, nomadSiteUrl, nomadSitePort: nomadPort,\n  nomadAllocStatus,\n  // Out of scope for this pass, and said rather than silently ignored.\n  composeUnsupported: Boolean(d.hasCompose && !d.hasDockerfile),\n  note: nomadNamespaceMissing\n    ? 'Nomad space not created yet: namespace creation needs an operator (management token).'\n    : (d.classifierUnsure ? 'Classifier was unsure; defaulted to Kubernetes.'\n    // Said plainly instead of showing a link that cannot work: the job\n    // was submitted but Nomad had not placed it yet when we answered.\n    : (nomadAttempted && !nomadSiteUrl && nomadJob === 'submitted'\n        ? 'Job submitted; no address yet because Nomad had not placed it when we answered.'\n        : null))\n} }];"
+      },
+      "id": "buildresult00001",
+      "name": "Build result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "respond000000001",
+      "name": "Respond to portal",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2620,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "hasrepo",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Validate input').first().json.hasRepo }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ifhasrepo0000001",
+      "name": "Has a GitHub repo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Validate input').first().json.owner }}/{{ $('Validate input').first().json.repo }}/languages",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "User-Agent",
+              "value": "cloudlab-n8n"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "repolanguages000",
+      "name": "Repo languages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        60,
+        180
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Validate input').first().json.owner }}/{{ $('Validate input').first().json.repo }}/readme",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.raw"
+            },
+            {
+              "name": "User-Agent",
+              "value": "cloudlab-n8n"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "reporeadme000000",
+      "name": "Repo readme",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        180
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Validate input').first().json.owner }}/{{ $('Validate input').first().json.repo }}/contents/",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "User-Agent",
+              "value": "cloudlab-n8n"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "repocontents0000",
+      "name": "Repo contents",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        180
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn whatever GitHub returned into FACTS. Every lookup is wrapped:\n// a rate limit (60/hr unauthenticated), a private repo, a deleted repo\n// or a GitHub outage must degrade this to text-only classification and\n// the default quota - never fail the submission.\nconst v = $('Validate input').first().json;\nconst NL = String.fromCharCode(10);\n\nfunction node(name) {\n  try { return $(name).first().json; } catch (e) { return null; }\n}\n\n// --- languages -------------------------------------------------------\nlet languages = {}, langCount = 0;\nconst L = node('Repo languages');\nif (L && !L.error && typeof L === 'object' && !Array.isArray(L)) {\n  for (const k of Object.keys(L)) {\n    if (typeof L[k] === 'number') { languages[k] = L[k]; langCount++; }\n  }\n}\n\n// --- readme ----------------------------------------------------------\n// Requested with Accept: vnd.github.raw, so this is plain text. n8n may\n// hand it back as a string or wrapped under .data depending on content\n// type sniffing, so both shapes are accepted.\nlet readme = '';\nconst R = node('Repo readme');\nif (R && !R.error) {\n  if (typeof R === 'string') readme = R;\n  else if (typeof R.data === 'string') readme = R.data;\n}\nreadme = String(readme).slice(0, 1500);\n\n// --- root file listing ------------------------------------------------\n// GitHub returns a JSON ARRAY here, and n8n splits an array response into\n// N SEPARATE ITEMS - so .first().json yields only the first file, never\n// the listing. Use .all() and map. This silently made hasDockerfile\n// permanently false, which Part B depends on. See Problem #118.\nlet files = [], hasDockerfile = false, hasCompose = false;\n// THE ACTUAL FILENAME, not an assumed one. Git is case-sensitive and\n// `dockerfile` is as valid as `Dockerfile`; Kaniko is handed this\n// verbatim rather than a guess (Problem #143).\nlet dockerfileName = '';\nlet defaultBranch = '';\ntry {\n  const items = $('Repo contents').all();\n  for (const it of items) {\n    const f = it.json;\n    if (f && typeof f.name === 'string') {\n      files.push(f.name);\n      // download_url embeds the default branch:\n      // raw.githubusercontent.com/<owner>/<repo>/<BRANCH>/<path>\n      // Free - avoids a 4th GitHub API call against a 60/hour budget.\n      if (!defaultBranch && typeof f.download_url === 'string') {\n        const dm = f.download_url.match(/raw\\.githubusercontent\\.com\\/[^/]+\\/[^/]+\\/([^/]+)\\//);\n        if (dm) defaultBranch = dm[1];\n      }\n      const n = f.name.toLowerCase();\n      if (n === 'dockerfile') { hasDockerfile = true; dockerfileName = f.name; }\n      if (n === 'docker-compose.yml' || n === 'docker-compose.yaml' ||\n          n === 'compose.yml' || n === 'compose.yaml' ||\n          n === 'compose.override.yml') hasCompose = true;\n    }\n  }\n} catch (e) { /* node did not run, or GitHub refused: stay empty */ }\n\n// Did the analysis actually produce anything? Used to tell the user the\n// truth about whether their link was read.\nconst repoAnalysed = v.hasRepo && (langCount > 0 || readme.length > 0 || files.length > 0);\n\n// --- QUOTA TIER: computed from FACTS, never chosen by the model --------\n// Three fixed tiers, not a formula. `standard` is byte-identical to the\n// existing user1/user2 pattern (Part 8) so the common case is unchanged,\n// and it is also the fallback whenever the repo could not be read.\nlet quotaTier = 'standard';\nif (repoAnalysed) {\n  if (langCount >= 3 || hasCompose) quotaTier = 'large';\n  else if (langCount <= 1 && !hasCompose) quotaTier = 'small';\n}\nconst TIERS = {\n  small:    { cpu: '500m',  memory: '1Gi' },\n  standard: { cpu: '1500m', memory: '2560Mi' },\n  large:    { cpu: '2000m', memory: '3Gi' }\n};\nconst quota = TIERS[quotaTier];\n\n\n// --- build path -------------------------------------------------------\n// A real image is built ONLY when the repo has a Dockerfile at its root.\n// Scope limit: single-Dockerfile projects. Multi-container compose is out\n// of scope for this pass and is deliberately NOT attempted.\nconst canBuild = Boolean(v.hasRepo && hasDockerfile && defaultBranch);\nconst buildTag = 'build-' + Math.floor(Date.now() / 1000);\nconst imageRef = '10.43.200.50:5000/' + v.namespace + '/app:' + buildTag;\nconst jobName = ('build-' + v.username + '-' + buildTag).slice(0, 60);\n\nconst bodyBuildJob = JSON.stringify({\n  apiVersion: 'batch/v1', kind: 'Job',\n  metadata: { name: jobName, labels: { tenant: v.username } },\n  spec: {\n    activeDeadlineSeconds: 900,\n    backoffLimit: 0,\n    ttlSecondsAfterFinished: 3600,\n    template: {\n      metadata: { labels: { app: 'kaniko-build', tenant: v.username } },\n      spec: {\n        restartPolicy: 'Never',\n        serviceAccountName: 'builder',\n        automountServiceAccountToken: false,\n        securityContext: { seccompProfile: { type: 'RuntimeDefault' } },\n        containers: [{\n          name: 'kaniko',\n          image: 'gcr.io/kaniko-project/executor:v1.23.2',\n          args: [\n            '--context=git://github.com/' + v.owner + '/' + v.repo +\n              '.git#refs/heads/' + defaultBranch,\n            // The real filename. A hardcoded 'Dockerfile' fails on any\n            // repo that spells it lowercase (Problem #143).\n            '--dockerfile=' + (dockerfileName || 'Dockerfile'),\n            '--destination=' + imageRef,\n            '--insecure', '--skip-tls-verify', '--single-snapshot',\n            '--verbosity=info'\n          ],\n          securityContext: {\n            privileged: false,\n            allowPrivilegeEscalation: false,\n            // Minimum found by attempting the real build and reading each\n            // error in turn: CHOWN, then FOWNER, then DAC_OVERRIDE.\n            // Unprivileged, no Docker socket, no host mounts, no k8s API.\n            capabilities: { drop: ['ALL'], add: ['CHOWN','FOWNER','DAC_OVERRIDE'] }\n          },\n          resources: {\n            requests: { cpu: '300m', memory: '512Mi' },\n            limits: { cpu: '1', memory: '1Gi' }\n          }\n        }]\n      }\n    }\n  }\n});\n\n// The tenant Deployment pointing at the image the build will produce.\n// It is created immediately and will sit in ImagePullBackOff until the\n// build pushes - Kubernetes retries pulls with backoff, so it starts by\n// itself. This is why the workflow does not block: a build takes minutes\n// and the portal's HTTP timeout is 60s.\nconst bodyBuiltDeployment = JSON.stringify({\n  apiVersion: 'apps/v1', kind: 'Deployment',\n  metadata: { name: 'app', labels: { app: 'app', 'built-by': 'kaniko' } },\n  spec: {\n    replicas: 1,\n    selector: { matchLabels: { app: 'app' } },\n    template: {\n      metadata: { labels: { app: 'app' } },\n      spec: {\n        containers: [{\n          name: 'app', image: imageRef, imagePullPolicy: 'IfNotPresent',\n          resources: {\n            requests: { cpu: '50m', memory: '64Mi' },\n            limits: { cpu: '500m', memory: '512Mi' }\n          }\n        }]\n      }\n    }\n  }\n});\n\n\n// --- Nomad path -------------------------------------------------------\n// Tenant Nomad namespaces are named tenant-<user>, matching the\n// Kubernetes convention AND matching the glob in n8n's ACL policy\n// (namespace \"tenant-*\"), which is what keeps this token out of user1,\n// user2 and default.\n//\n// SCOPE LIMIT, proven not assumed: creating a Nomad NAMESPACE or ACL\n// POLICY is a management-only operation - a scoped token gets 403. n8n\n// therefore submits jobs into a namespace that must already exist, and\n// says so plainly when it does not. See the handoff.\nconst nomadNamespace = v.namespace;   // tenant-<user>\n\n// The starter job mirrors the Kubernetes nginx:alpine fallback: a known\n// -good public image, no build required. http-echo is what default/hello\n// already runs on this cluster, so the driver and image are proven here.\nconst nomadJobId = 'starter';\n// UPGRADE IN PLACE, once the build actually exists. Same object as the\n// starter, same selector (a Deployment's selector is immutable anyway),\n// so this is a rolling update rather than a second Deployment plus a\n// Service-selector move (Part 23 item 16).\nconst bodyRepoUpgrade = JSON.stringify({\n  apiVersion: 'apps/v1', kind: 'Deployment',\n  metadata: { name: 'starter', labels: { app: 'starter', 'built-by': 'kaniko' } },\n  spec: {\n    replicas: 1,\n    selector: { matchLabels: { app: 'starter' } },\n    template: {\n      metadata: { labels: { app: 'starter' } },\n      spec: { containers: [{\n        name: 'app', image: imageRef, imagePullPolicy: 'IfNotPresent',\n        resources: { requests: { cpu: '50m', memory: '64Mi' },\n                     limits: { cpu: '500m', memory: '512Mi' } }\n      }] }\n    }\n  }\n});\n\nconst bodyNomadJob = JSON.stringify({\n  Job: {\n    ID: nomadJobId, Name: nomadJobId, Type: 'service',\n    Namespace: nomadNamespace, Datacenters: ['*'],\n    TaskGroups: [{\n      Name: 'app', Count: 1,\n      Networks: [{ DynamicPorts: [{ Label: 'http', To: 5678 }] }],\n      Tasks: [{\n        Name: 'app', Driver: 'docker',\n        Config: {\n          image: 'hashicorp/http-echo:latest',\n          args: ['-text=' + v.username + ' is running on Nomad',\n                 '-listen=:5678'],\n          ports: ['http']\n        },\n        Resources: { CPU: 100, MemoryMB: 64 }\n      }]\n    }]\n  }\n});\n\n\n// Nomad pulls over the LAN address, not the ClusterIP. Kaniko pushes to\n// 10.43.200.50:5000 (in-cluster) and k3s pulls from there; Nomad runs on\n// a separate VM that cannot route to a ClusterIP, so it uses the\n// registry-external LoadBalancer. SAME image, same digest, two doors.\nconst nomadImageRef = imageRef.replace('10.43.200.50:5000', '192.168.1.50:5000');\n\n// A Nomad job running the tenant's OWN built image.\n// No port mapping is declared: the port an arbitrary repo listens on is\n// unknown, and guessing one would produce a job that looks healthy while\n// exposing nothing. The Kubernetes built-image path makes the same\n// choice. Exposing tenant services is a separate piece of work.\n// bodyNomadBuiltJob is MOVED: see below. It needs `appPort`, which is not\n// computed until further down, so constructing it here read undefined.\n\n// --- the port the tenant's app actually listens on ---------------------\n// An Ingress pointing at the wrong port produces a CLICKABLE LINK THAT\n// 502s, which is worse for a user than no link at all. So the port is\n// READ from the Dockerfile's EXPOSE rather than assumed.\n//\n// Fetched from raw.githubusercontent.com, which is a DIFFERENT HOST from\n// api.github.com and does not spend its 60/hour budget. Degrades like\n// every other lookup here: no Dockerfile, no EXPOSE, a private repo or an\n// outage all fall back to 80 and SAY SO through portSource, which the\n// portal shows the user rather than hiding.\nlet appPort = 80, portSource = 'default';\n{\n  const D = node('Repo dockerfile');\n  let text = '';\n  if (D && !D.error) {\n    if (typeof D === 'string') text = D;\n    else if (typeof D.data === 'string') text = D.data;\n  }\n  // Last EXPOSE wins, matching Docker: a later build stage overrides an\n  // earlier one. Only the FIRST port of a multi-port EXPOSE is used -\n  // serving one of several is right; guessing which of several is not\n  // something this can do, so it is not attempted.\n  const lines = String(text).split(/\\r?\\n/);\n  for (const ln of lines) {\n    const m = ln.match(/^\\s*EXPOSE\\s+(\\d{1,5})/i);\n    if (m) {\n      const p = parseInt(m[1], 10);\n      if (p >= 1 && p <= 65535) { appPort = p; portSource = 'EXPOSE'; }\n    }\n  }\n}\n\n// --- the tenant's browsable address ------------------------------------\n// The NAMESPACE is the host label, not the raw username. Usernames may\n// contain dots (amine.beji); the namespace is already sanitised to\n// [a-z0-9-] and <=63 chars by Validate input, so reusing it makes host\n// and namespace IDENTICAL rather than merely both-valid.\n//\n// NOT because a wildcard would fail to match a dotted name - it would\n// match fine. RFC 4592: *.apps.cloudlab.internal covers any name below\n// apps.cloudlab.internal at ANY depth. Measured against the live zone:\n// a.b.c.apps.cloudlab.internal and tenant-amine.beji.apps.cloudlab.internal\n// both resolve. An earlier comment here claimed the opposite.\n// --- the built Nomad job, now that appPort is known -------------------\n// A dynamic port is REQUIRED, not decorative: without a Networks block\n// the container publishes nothing and there is no allocation port to\n// read, so the tenant could never have a URL. `To` maps the random host\n// port to the port the Dockerfile actually EXPOSEs.\n// The Service must follow the port the Dockerfile declared, or the\n// upgraded pod listens on 3000 while the Service still points at 80 and\n// the tenant gets a clickable link that 502s - Problem #130's shape.\n// Applied AFTER the new pod is up, never before: pointing the Service at\n// a port nothing listens on yet breaks the site during the rollout.\nconst bodyRepoUpgradeSvc = JSON.stringify({\n  apiVersion: 'v1', kind: 'Service',\n  metadata: { name: 'site-k8s', labels: { 'provisioned-by': 'n8n' } },\n  spec: { selector: { app: 'starter' },\n    ports: [{ name: 'http', port: 80, targetPort: appPort || 80 }] }\n});\n\nconst bodyNomadBuiltJob = JSON.stringify({\n  Job: {\n    ID: nomadJobId, Name: nomadJobId, Type: 'service',\n    Namespace: nomadNamespace, Datacenters: ['*'],\n    TaskGroups: [{\n      Name: 'app', Count: 1,\n      Networks: [{ DynamicPorts: [{ Label: 'http', To: appPort }] }],\n      // SURVIVE THE BUILD RACE. This job is submitted while Kaniko is\n      // still pushing, so the first pulls WILL fail. Nomad's default is\n      // attempts:2/mode:'fail', which kills the allocation permanently\n      // ~30s in and leaves a dead job behind a live URL. Retry patiently\n      // instead, so the task starts by itself once the image lands -\n      // the same self-healing Kubernetes gets from ImagePullBackOff.\n      RestartPolicy: { Attempts: 20, Interval: 3600000000000,\n                       Delay: 20000000000, Mode: 'delay' },\n      Tasks: [{\n        Name: 'app', Driver: 'docker',\n        Config: { image: nomadImageRef, ports: ['http'] },\n        Resources: { CPU: 200, MemoryMB: 256 }\n      }]\n    }]\n  }\n});\n\n// --- which manifest describes how to build this project? --------------\n// First match wins, in the order a human would look. '' means we found\n// none, which is itself a fact the generator is told rather than left\n// to infer from silence.\nconst MANIFESTS = ['package.json', 'requirements.txt', 'go.mod',\n                   'Gemfile', 'composer.json', 'pyproject.toml',\n                   'Cargo.toml', 'pom.xml'];\nconst lowerFiles = files.map(f => String(f).toLowerCase());\nlet manifestName = '';\nfor (const m of MANIFESTS) {\n  if (lowerFiles.indexOf(m.toLowerCase()) !== -1) { manifestName = m; break; }\n}\n// A static site has no manifest at all, and that is the EASIEST case to\n// generate for - so absence is reported, never treated as a failure.\nconst looksStatic = !manifestName &&\n  lowerFiles.some(f => f === 'index.html' || f.endsWith('.html'));\n\nconst siteHost = v.namespace + '.apps.cloudlab.internal';\nconst siteUrl = 'http://' + siteHost + '/';\n\n// --- the classifier prompt -------------------------------------------\n// README is the primary signal when it has real content; language stats\n// are the fallback that exists even when the README is missing or empty.\nconst SYS = 'You classify hosting requests for a small cloud platform. ' +\n  'Reply with EXACTLY one word from this list and nothing else: kubernetes, nomad, both. ' +\n  'kubernetes = needs to scale, has several components, or must stay available continuously. ' +\n  'nomad = simple and small, quick to deploy, a single tool or prototype. ' +\n  'both = the request is vague, or genuinely needs both kinds of workload. ' +\n  'Answer with one word only. Never explain.';\n\nlet user = 'What the person wrote: ' + v.prompt;\nif (langCount > 0) {\n  const top = Object.keys(languages).sort((a,b) => languages[b]-languages[a]).slice(0,6);\n  // NL is built with fromCharCode: a literal newline escape\n  // inside this string does not survive the JSON round-trip.\n  user += NL + NL + 'Languages in their repository: ' + top.join(', ') + '.';\n}\nif (files.length > 0) {\n  // NL is built with fromCharCode: a literal newline escape\n  // inside this string does not survive the JSON round-trip.\n  user += NL + NL + 'Files at the repository root: ' + files.slice(0,25).join(', ') + '.';\n}\nif (readme.trim().length > 40) {\n  // NL is built with fromCharCode: a literal newline escape\n  // inside this string does not survive the JSON round-trip.\n  user += NL + NL + 'Their README (most reliable signal, may be truncated):' + NL + readme;\n}\n\nconst groqBody = JSON.stringify({\n  model: 'openai/gpt-oss-20b', temperature: 0, max_tokens: 512,\n  reasoning_effort: 'low',\n  messages: [\n    { role: 'system', content: SYS },\n    { role: 'user', content: user }\n  ]\n});\n\nreturn [{ json: { ...v, languages, langCount, readmeChars: readme.length,\n  defaultBranch, canBuild, imageRef, jobName, bodyBuildJob, bodyBuiltDeployment,\n  nomadNamespace, nomadJobId, bodyNomadJob,\n  nomadImageRef, bodyNomadBuiltJob,\n  files, hasDockerfile, hasCompose, dockerfileName, repoAnalysed, quotaTier, quota,\n  appPort, portSource, siteHost, siteUrl,\n  manifestName, looksStatic,\n  groqBody } }];"
+      },
+      "id": "analyserepo00001",
+      "name": "Analyse repo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "canbuild",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Analyse repo').first().json.canBuild }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ifcanbuild000001",
+      "name": "Repo has a Dockerfile?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Analyse repo').first().json.bodyBuildJob }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "createbuildjob01",
+      "name": "Start image build",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1520,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "waitforbuild0001",
+      "name": "Give the build a moment",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1740,
+        300
+      ],
+      "webhookId": "build-wait-hook"
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs/{{ $('Analyse repo').first().json.jobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "checkbuild000001",
+      "name": "Check build status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "isnomad",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $('Pick from fixed menu').first().json.choice }}",
+              "rightValue": "nomad"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ifnomad00000001",
+      "name": "Nomad was chosen?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://192.168.1.51:4646/v1/jobs?namespace={{ $('Analyse repo').first().json.nomadNamespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Analyse repo').first().json.bodyNomadJob }}",
+        "options": {
+          "timeout": 25000
+        }
+      },
+      "id": "submitnomadjob01",
+      "name": "Submit Nomad job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        560
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "nomadcanbuild",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Analyse repo').first().json.canBuild }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ifnomadbuild0001",
+      "name": "Can we build for Nomad?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Analyse repo').first().json.bodyBuildJob }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "nomadstartbuild1",
+      "name": "Start image build for Nomad",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2180,
+        640
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://192.168.1.51:4646/v1/jobs?namespace={{ $('Analyse repo').first().json.nomadNamespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Analyse repo').first().json.bodyNomadBuiltJob }}",
+        "options": {
+          "timeout": 25000
+        }
+      },
+      "id": "submitnomadbuilt",
+      "name": "Submit Nomad job (built image)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        640
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://raw.githubusercontent.com/{{ $('Validate input').first().json.owner }}/{{ $('Validate input').first().json.repo }}/HEAD/{{ $('Repo contents').all().map(i => i.json.name).find(n => n && n.toLowerCase() === 'dockerfile') || 'Dockerfile' }}",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "cloudlab-n8n"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "repodockerfile0001",
+      "name": "Repo dockerfile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -160,
+        40
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Resolves the Dockerfile's real filename from the repo listing - `dockerfile` is as valid as `Dockerfile` and a 404 here silently defaulted the port (Problem #143)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Which deployment actually landed decides what the Service selects and\n// which port it targets. Exactly one of the two ran.\nconst a = $('Analyse repo').first().json;\n\nfunction ok(name) {\n  try {\n    const j = $(name).first().json;\n    if (!j) return false;\n    // Same shape test as Build result: a created object carries a kind,\n    // and a Namespace carries BOTH a kind and a status - so test the\n    // kind, never the presence of a status field (Problem #117).\n    if (j.kind && j.kind !== 'Status') return true;\n    const s = JSON.stringify(j);\n    return s.indexOf('AlreadyExists') !== -1 || s.indexOf('409') !== -1;\n  } catch (e) { return false; }\n}\n\n// The built image is no longer deployed before the response - it is\n// polled for and patched in afterwards, so at THIS point the only\n// thing serving is always the starter. Keeping ok('Deploy built\n// image') here would silently read false forever against a node\n// that no longer exists.\nconst builtRan = false;\nconst starterRan = !builtRan && ok('Create starter deployment');\nconst selector = builtRan ? 'app' : 'starter';\n// The starter is nginx:alpine, where 80 is a FACT rather than an\n// inference. Only the built path carries a port read out of a Dockerfile,\n// so only it can be wrong - and only it reports portSource to the user.\nconst targetPort = builtRan ? a.appPort : 80;\nconst portSource = builtRan ? a.portSource : 'known';\nconst hasSite = builtRan || starterRan;\n\n// The Service always publishes on 80 and maps to the app's real port, so\n// the Ingress backend is ONE fixed shape whichever path ran.\nconst bodyService = JSON.stringify({\n  apiVersion: 'v1', kind: 'Service',\n  metadata: { name: 'site-k8s', labels: { 'provisioned-by': 'n8n' } },\n  spec: { selector: { app: selector },\n    ports: [{ name: 'http', port: 80, targetPort: targetPort }] }\n});\nconst bodyIngress = JSON.stringify({\n  apiVersion: 'networking.k8s.io/v1', kind: 'Ingress',\n  metadata: { name: 'site', labels: { 'provisioned-by': 'n8n' } },\n  spec: { ingressClassName: 'traefik',\n    rules: [{ host: a.siteHost, http: { paths: [{ path: '/', pathType: 'Prefix',\n      backend: { service: { name: 'site-k8s', port: { number: 80 } } } }] } }] }\n});\n\nreturn [{ json: { hasSite, builtRan, starterRan, selector, targetPort,\n  portSource, siteHost: a.siteHost, siteUrl: a.siteUrl,\n  bodyService, bodyIngress } }];"
+      },
+      "id": "decidesite00000001",
+      "name": "Decide site",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/services/site-k8s?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "options": {
+          "timeout": 20000
+        },
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Decide site').first().json.bodyService }}"
+      },
+      "id": "createservice000001",
+      "name": "Create service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1420,
+        60
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/networking.k8s.io/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/ingresses/site?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "options": {
+          "timeout": 20000
+        },
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Decide site').first().json.bodyIngress }}"
+      },
+      "id": "createingress000001",
+      "name": "Create ingress",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        60
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Did the build Job actually get a POD, or was it admitted and then\n// starved by the ResourceQuota?\n//\n// The quota caps the build namespace at TWO concurrent Kaniko pods\n// (requests.memory 1Gi, 512Mi each). A third submission's Job is\n// CREATED normally - 201, kind:Job - and only its pod is refused, so\n// the creation response proves nothing. The Job's own status does:\n//\n//   pod running  -> {\"active\":1,\"ready\":1,...}\n//   pod refused  -> {\"ready\":0,...}   <- no `active` key\n//\n// Verified against the live API during a deliberate three-way\n// concurrent submission, not inferred from documentation.\nlet st = null;\ntry { st = $('Check build status').first().json.status || null; } catch (e) { st = null; }\n\nconst active = st && Number(st.active) > 0;\nconst done = st && Number(st.succeeded) > 0;\n// A build that already FAILED is not a reason to fall back to the\n// starter - the tenant's image was attempted and lost on its own\n// merits, which is a different message from 'the platform was busy'.\nconst failed = st && Number(st.failed) > 0;\nconst buildPodStarted = Boolean(active || done || failed);\n\nreturn [{ json: { buildPodStarted, buildActive: Boolean(active),\n  buildDone: Boolean(done), buildFailedEarly: Boolean(failed),\n  // Distinguishes 'refused by quota' from 'job missing entirely'.\n  jobStatusSeen: st !== null } }];"
+      },
+      "id": "buildpodstarted001",
+      "name": "Did a build pod start?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "buildpod",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.buildPodStarted }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "buildhaspod000001",
+      "name": "Build has a pod?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "userdecided",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.userDecided }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "explicitchoice0001",
+      "name": "Explicit choice?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 12,
+        "unit": "seconds"
+      },
+      "id": "waitfornomad0001",
+      "name": "Give Nomad a moment",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "nomad-wait-hook",
+      "position": [
+        2000,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://192.168.1.51:4646/v1/job/{{ $('Analyse repo').first().json.nomadJobId }}/allocations?namespace={{ $('Analyse repo').first().json.nomadNamespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "listnomadallocs01",
+      "name": "List Nomad allocations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2180,
+        520
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// WHICH allocation, and it matters more than it looks. After a\n// resubmission the job has BOTH the old stopped allocation and the new\n// running one, and the old one carries the OLD port. Picking the wrong\n// entry would wire the tenant's URL to a port nothing listens on - the\n// exact stale-object failure the Kubernetes side was just fixed for.\n// So: prefer running, and among those the highest CreateIndex.\n// EMPTY-SAFE. With no Nomad namespace the job does not exist, so the\n// list call 404s and this node receives one empty/error item rather\n// than allocations. That is a NORMAL, operator-fixable state, and it\n// must flow on to Build result so the user gets the real reason - not\n// stop the branch and leave the portal timing out on no answer at all.\nlet allocs = [];\ntry {\n  allocs = $input.all().map(i => i.json).filter(x => x && x.ID);\n} catch (e) { allocs = []; }\n\nconst running = allocs.filter(x => x.ClientStatus === 'running');\nconst pool = running.length ? running : allocs;\npool.sort((x, y) => (y.CreateIndex || 0) - (x.CreateIndex || 0));\nconst chosen = pool[0] || null;\n\nreturn [{ json: {\n  allocId: chosen ? chosen.ID : '',\n  allocStatus: chosen ? chosen.ClientStatus : null,\n  allocCount: allocs.length, runningCount: running.length,\n  // An empty allocId is a real, expected state (nothing placed yet). It\n  // is reported rather than papered over, and it ends with NO url.\n  havePlacement: Boolean(chosen && chosen.ClientStatus === 'running')\n} }];"
+      },
+      "id": "picknomadalloc001",
+      "name": "Pick the live allocation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2360,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://192.168.1.51:4646/v1/allocation/{{ $json.allocId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "readnomadalloc001",
+      "name": "Read Nomad allocation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2540,
+        520
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// The tenant's REAL address on the Nomad host. Read from the allocation,\n// never assumed: the port is dynamic and changes on every placement.\n//\n// Source of truth is AllocatedResources.Shared.Ports[] -> {HostIP, Value}.\n// Shared.Networks[].DynamicPorts[] is the fallback for older shapes.\n// NOTE the list endpoint /v1/job/<id>/allocations returns a SUMMARY with\n// no AllocatedResources at all - the detail fetch is not optional.\nconst a = $('Analyse repo').first().json;\nconst pick = $('Pick the live allocation').first().json;\n// May be an error item or empty when nothing was placed - every read\n// below is already guarded, and haveAddr ends up false, which means no\n// URL is reported rather than a broken one.\nlet alloc = {};\ntry { alloc = $input.first().json || {}; } catch (e) { alloc = {}; }\n\nlet host = null, port = null;\ntry {\n  const res = alloc.AllocatedResources || {};\n  const shared = res.Shared || {};\n  const ports = shared.Ports || [];\n  const p = ports.find(x => x.Label === 'http') || ports[0];\n  if (p) { host = p.HostIP || null; port = p.Value || null; }\n  if (!port) {\n    for (const n of (shared.Networks || [])) {\n      const dyn = n.DynamicPorts || [];\n      const d = dyn.find(x => x.Label === 'http') || dyn[0];\n      if (d && d.Value) { host = host || n.IP; port = d.Value; break; }\n    }\n  }\n} catch (e) { host = null; port = null; }\n\n// A URL is only honest if BOTH halves are real. No port means no link -\n// the same rule the Kubernetes path follows, because a link that is\n// guaranteed to 502 is worse for a user than an honest 'not yet'.\nconst haveAddr = Boolean(host && port);\nconst allocRunning = alloc.ClientStatus === 'running';\n\n// The Service carries NO selector: nothing in this cluster backs it, the\n// EndpointSlice does. For a selector-less Service the SLICE's port is\n// authoritative and the Service's targetPort is ignored - matched by\n// port NAME - which is why the port lives in the slice below and any\n// assertion about it must read the slice, not the Service.\nconst bodyNomadService = JSON.stringify({\n  apiVersion: 'v1', kind: 'Service',\n  metadata: { name: 'site-nomad-svc', labels: { 'provisioned-by': 'n8n' } },\n  spec: { ports: [{ name: 'http', port: 80, protocol: 'TCP' }] }\n});\n\n// port is the value READ above. If this is ever replaced by a constant,\n// the tenant gets a link that cannot work - wfcheck.js asserts against it.\nconst bodyNomadSlice = JSON.stringify({\n  apiVersion: 'discovery.k8s.io/v1', kind: 'EndpointSlice',\n  metadata: { name: 'site-nomad',\n    labels: { 'kubernetes.io/service-name': 'site-nomad-svc', 'provisioned-by': 'n8n' } },\n  addressType: 'IPv4',\n  ports: [{ name: 'http', port: port || 0, protocol: 'TCP' }],\n  // READY means 'this address can take traffic', which is a fact about\n  // the ALLOCATED PORT, not about whether the task has started yet.\n  // Gating it on allocRunning pinned it false forever for a built image\n  // (nothing revisits this object), so the site could never come up even\n  // after the build succeeded. With it true, Traefik routes as soon as\n  // the task does - 502 until then, 200 after, with no rerun needed.\n  // The user is told the honest state separately through siteReady.\n  endpoints: [{ addresses: [host || '0.0.0.0'], conditions: { ready: haveAddr } }]\n});\n\nconst bodyNomadIngress = JSON.stringify({\n  apiVersion: 'networking.k8s.io/v1', kind: 'Ingress',\n  metadata: { name: 'site', labels: { 'provisioned-by': 'n8n' } },\n  spec: { ingressClassName: 'traefik',\n    rules: [{ host: a.siteHost, http: { paths: [{ path: '/', pathType: 'Prefix',\n      backend: { service: { name: 'site-nomad-svc', port: { number: 80 } } } }] } }] }\n});\n\nreturn [{ json: {\n  nomadHost: host, nomadPort: port, haveAddr, allocRunning,\n  allocStatus: pick.allocStatus, allocCount: pick.allocCount,\n  siteHost: a.siteHost, siteUrl: a.siteUrl,\n  bodyNomadService, bodyNomadSlice, bodyNomadIngress\n} }];"
+      },
+      "id": "decidenomadsite01",
+      "name": "Decide Nomad site",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2720,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/services/site-nomad-svc?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Decide Nomad site').first().json.bodyNomadService }}"
+      },
+      "id": "nomadservice00001",
+      "name": "Create nomad service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2900,
+        520
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/discovery.k8s.io/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/endpointslices/site-nomad?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Decide Nomad site').first().json.bodyNomadSlice }}"
+      },
+      "id": "nomadslice000001",
+      "name": "Create nomad endpoints",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3080,
+        520
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/networking.k8s.io/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/ingresses/site?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Decide Nomad site').first().json.bodyNomadIngress }}"
+      },
+      "id": "nomadingress00001",
+      "name": "Create nomad ingress",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3260,
+        520
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "nomadNsCreator01",
+          "mode": "list",
+          "cachedResultName": "Nomad Namespace Creator"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "ensurenomadns001",
+      "name": "Ensure Nomad namespace",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        1180,
+        700
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Calls the Nomad Namespace Creator workflow by ID. This workflow holds NO Nomad management credential; the token lives only in the sub-workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The ONLY thing the namespace creator needs. Passing one explicit,\n// named field keeps the sub-workflow trivial to read and means it can\n// never depend on the shape of whatever ran before it here.\nconst ns = $('Analyse repo').first().json.nomadNamespace;\nreturn [{ json: { namespace: ns } }];"
+      },
+      "id": "nsname0000000001",
+      "name": "Namespace to create",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://raw.githubusercontent.com/{{ $('Validate input').first().json.owner }}/{{ $('Validate input').first().json.repo }}/HEAD/{{ $('Analyse repo').first().json.manifestName || 'package.json' }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "repomanifest0001",
+      "name": "Repo manifest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Reads the project manifest so the generator works from facts, not guesses. raw.githubusercontent.com does not spend the api.github.com rate budget."
+    },
+    {
+      "parameters": {
+        "jsCode": "// THE PROMPT. Deliberately constrained: the model is given FACTS read\n// from the repo and a fixed set of rules, and asked for one artefact.\n// It decides nothing about the platform, the quota, the namespace or\n// the port the Service will use - it writes text that Kaniko then\n// treats exactly like any human-written Dockerfile.\n//\n// SCOPE, enforced here and documented in Part 23: ONE container. No\n// separate database/cache/broker server. An embedded file-based store\n// (SQLite) is fine because it lives inside the same container.\nconst a = $('Analyse repo').first().json;\n\nlet manifest = '';\ntry {\n  const m = $('Repo manifest').first().json;\n  const raw = (typeof m === 'string') ? m : (m && (m.data || m.body || ''));\n  manifest = String(raw || '');\n  // A 404 page is not a manifest. Treat it as absent rather than feeding\n  // the model an error document as though it were project metadata.\n  if (/^404: Not Found/.test(manifest)) manifest = '';\n} catch (e) { manifest = ''; }\n\nconst SYS = [\n'You write Dockerfiles. Output ONLY the Dockerfile text.',\n'',\n'Rules, all mandatory:',\n'- Output raw Dockerfile content and nothing else: no explanation, no',\n'  commentary, no markdown, no ``` fences.',\n'- ONE container only. Never assume a separate database, cache or message',\n'  broker exists. An embedded file-based database (SQLite) is fine.',\n'- Start FROM an official minimal image matched to the project',\n'  (node:20-alpine, python:3.12-slim, golang:1.22-alpine, nginx:alpine).',\n'- If the project needs a build step, use multi-stage and copy only the',\n'  built artefact into the final stage.',\n'- Install dependencies from the project own manifest with a',\n'  reproducible command (npm ci, pip install -r, go mod download).',\n'- Never run apt-get upgrade. Never use interactive commands.',\n'- End with EXPOSE <port> and a CMD that runs the app in the foreground.',\n'  EXPOSE must be the port the application really listens on.',\n'- When copying application files, COPY the whole project directory',\n'  rather than naming individual files. Naming files misses assets that',\n'  are referenced at runtime (images, fonts, sub-directories) and',\n'  produces a site with broken links.',\n'- If the project is static files with no build step, serve it with',\n'  nginx:alpine and EXPOSE 80.',\n'- No VOLUME. No ENTRYPOINT script unless you create it in the Dockerfile.'\n].join(String.fromCharCode(10));\n\nconst lines = [\n  'Repository: ' + a.owner + '/' + a.repo,\n  'Languages: ' + (Object.keys(a.languages || {}).join(', ') || 'unknown'),\n  'Root files: ' + (a.files || []).slice(0, 40).join(', '),\n  'Manifest (' + (a.manifestName || 'none found') + '):',\n  manifest ? manifest.slice(0, 1500) : '(no manifest file in this repo)',\n  '',\n  'README (first 400 chars): ' + String(a.readme || '').slice(0, 400),\n  '',\n  'Generate the Dockerfile.'\n];\nif (a.looksStatic) lines.splice(3, 0,\n  'This repo looks like plain static files with no build step.');\n\nconst dockerPrompt = JSON.stringify({\n  model: 'openai/gpt-oss-20b', temperature: 0, max_tokens: 1024,\n  reasoning_effort: 'low',\n  messages: [{ role: 'system', content: SYS },\n             { role: 'user', content: lines.join(String.fromCharCode(10)) }]\n});\n\nreturn [{ json: { ...a, dockerSys: SYS, dockerPrompt, manifestChars: manifest.length } }];"
+      },
+      "id": "dockerprompt0001",
+      "name": "Write the Dockerfile prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.dockerPrompt }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "id": "gendockerfile0001",
+      "name": "Generate a Dockerfile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "groqApiCred0001",
+          "name": "Groq API"
+        }
+      },
+      "notes": "Same model and credential as the platform classifier. It produces TEXT; every decision that follows is made from measured facts."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the Dockerfile, validate it, and build the Kaniko Job body.\n// The model is asked for raw text, but a model that ignores that and\n// wraps its answer in ``` fences must not be able to produce a broken\n// build - so the fences are stripped rather than trusted not to appear.\nconst a = $('Analyse repo').first().json;\nconst v = $('Validate input').first().json;\nconst attempt = 1;\n\nlet text = '';\ntry {\n  const r = $('Generate a Dockerfile').first().json;\n  text = String(r?.choices?.[0]?.message?.content ?? '');\n} catch (e) { text = ''; }\n\n// Strip markdown fences and any leading prose before the first FROM.\ntext = text.replace(/```[a-zA-Z]*\\n?/g, '').replace(/```/g, '').trim();\nconst fromAt = text.search(/^\\s*FROM\\s+\\S+/mi);\nif (fromAt > 0) text = text.slice(fromAt);\n\n// VALIDATION. Anything that fails here means no build is attempted at\n// all - the tenant keeps the working starter rather than being handed a\n// build that cannot succeed.\nconst tooBig = text.length > 8192;\nconst hasFrom = /^\\s*FROM\\s+\\S+/mi.test(text);\nconst usable = Boolean(text) && hasFrom && !tooBig;\n\n// The port comes from the generated EXPOSE, exactly as it is read from a\n// human-written Dockerfile. If the model omitted it we fall back to 80\n// and SAY SO through portSource, never silently.\nlet aiPort = 80, aiPortSource = 'default';\nconst m = text.match(/^\\s*EXPOSE\\s+([0-9]{2,5})/mi);\nif (m) { aiPort = parseInt(m[1], 10); aiPortSource = 'dockerfile'; }\n\nconst stamp = Math.floor(Date.now() / 1000);\nconst jobName = ('ai' + attempt + '-' + v.namespace + '-' + stamp).slice(0, 60);\nconst imageRef = '10.43.200.50:5000/' + v.namespace + '/app:ai' + attempt + '-' + stamp;\n\n// THE SANDBOX IS IDENTICAL TO THE HUMAN-WRITTEN PATH. Same namespace,\n// same `builder` service account, same dropped capabilities, same\n// resource limits, same NetworkPolicy. An AI-authored Dockerfile gets no\n// special treatment and no special trust - the pipeline already builds\n// arbitrary Dockerfiles written by strangers on public GitHub.\n//\n// The ONLY difference is delivery: an init container writes the\n// generated text into an emptyDir and kaniko reads it by absolute path.\n// Hand-proved before this was written; needs no extra RBAC. Its requests\n// are tiny so the pod's effective request stays 512Mi and the build\n// namespace still admits exactly two concurrent builds.\nconst bodyAiBuild = JSON.stringify({\n  apiVersion: 'batch/v1', kind: 'Job',\n  metadata: { name: jobName, labels: { tenant: v.username, aibuild: 'yes' } },\n  spec: {\n    // 900s, the SAME bound the human-written path uses. 420s was my\n    // number and it killed two perfectly good Dockerfiles: the\n    // hand-proof of this very build took 552s at this uplink.\n    activeDeadlineSeconds: 900,\n    backoffLimit: 0,\n    ttlSecondsAfterFinished: 3600,\n    template: {\n      metadata: { labels: { app: 'kaniko-build', tenant: v.username } },\n      spec: {\n        restartPolicy: 'Never',\n        serviceAccountName: 'builder',\n        automountServiceAccountToken: false,\n        securityContext: { seccompProfile: { type: 'RuntimeDefault' } },\n        volumes: [{ name: 'gen', emptyDir: {} }],\n        initContainers: [{\n          name: 'write-dockerfile',\n          image: 'busybox:1.36',\n          command: ['sh', '-c', 'printf %s \"$DOCKERFILE\" > /gen/Dockerfile'],\n          env: [{ name: 'DOCKERFILE', value: text }],\n          volumeMounts: [{ name: 'gen', mountPath: '/gen' }],\n          resources: { requests: { cpu: '10m', memory: '16Mi' },\n                       limits: { cpu: '100m', memory: '64Mi' } }\n        }],\n        containers: [{\n          name: 'kaniko',\n          image: 'gcr.io/kaniko-project/executor:v1.23.2',\n          args: [\n            '--context=git://github.com/' + v.owner + '/' + v.repo +\n              '.git#refs/heads/' + a.defaultBranch,\n            '--dockerfile=/gen/Dockerfile',\n            '--destination=' + imageRef,\n            '--insecure', '--skip-tls-verify', '--single-snapshot',\n            '--verbosity=info'\n          ],\n          securityContext: {\n            privileged: false, allowPrivilegeEscalation: false,\n            capabilities: { drop: ['ALL'], add: ['CHOWN','FOWNER','DAC_OVERRIDE'] }\n          },\n          volumeMounts: [{ name: 'gen', mountPath: '/gen' }],\n          resources: { requests: { cpu: '300m', memory: '512Mi' },\n                       limits: { cpu: '1', memory: '1Gi' } }\n        }]\n      }\n    }\n  }\n});\n\nreturn [{ json: { ...a, attempt, dockerfile: text, usable, hasFrom, tooBig,\n  aiPort, aiPortSource, aiJobName: jobName, aiImageRef: imageRef,\n  bodyAiBuild } }];"
+      },
+      "id": "checkdockerfile01",
+      "name": "Check the generated Dockerfile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1060,
+        900
+      ],
+      "notes": "Strips fences, requires a real FROM, reads EXPOSE for the port, and builds a Kaniko Job identical to the human-written path except for how the Dockerfile is delivered."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.bodyAiBuild }}"
+      },
+      "id": "startaibuild0001",
+      "name": "Start AI build",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1240,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "Same sandbox as every other build in this lab."
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "waitaibuild00001",
+      "name": "Give the AI build time",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "waitaibuild00001-hook",
+      "position": [
+        1420,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs/{{ $('Check the generated Dockerfile').first().json.aiJobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "checkaibuild0001",
+      "name": "Check AI build status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "The Job is bounded at 420s, so by now it has genuinely finished or failed."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "aibuildok0000001-c",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.status && $json.status.succeeded > 0 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "aibuildok0000001",
+      "name": "AI build succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/build/pods?labelSelector=job-name%3D{{ $('Check the generated Dockerfile').first().json.aiJobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "readbuilderror01",
+      "name": "Read the build error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        1080
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "Finds the failed build pod so its log can be fed back to the model."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/build/pods/{{ $json.items && $json.items[0] ? $json.items[0].metadata.name : 'none' }}/log?container=kaniko&tailLines=60",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "readbuildlog0001",
+      "name": "Read the build log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1960,
+        1080
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "The actual Kaniko error, so the retry can self-correct from evidence rather than guesswork."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ONE retry, and only one. The build error is fed back so the model can\n// correct a real fault rather than resample blindly. If this attempt\n// also fails the tenant keeps the working starter and is told plainly -\n// no third try, no loop.\nconst c = $('Check the generated Dockerfile').first().json;\nlet log = '';\ntry {\n  const r = $('Read the build log').first().json;\n  log = String((typeof r === 'string') ? r : (r?.data ?? r?.body ?? ''));\n} catch (e) { log = ''; }\n\nconst user = [\n  'The Dockerfile below FAILED to build. Fix the cause and output a',\n  'corrected Dockerfile, following the same rules.',\n  '',\n  '--- your previous Dockerfile ---',\n  c.dockerfile,\n  '--- build error (last 1500 chars) ---',\n  log.slice(-1500) || '(no build log was available)'\n].join(String.fromCharCode(10));\n\nconst dockerPrompt = JSON.stringify({\n  model: 'openai/gpt-oss-20b', temperature: 0, max_tokens: 1024,\n  reasoning_effort: 'low',\n  messages: [{ role: 'system', content: c.dockerSys ||\n                $('Write the Dockerfile prompt').first().json.dockerSys },\n             { role: 'user', content: user }]\n});\nreturn [{ json: { ...c, dockerPrompt, buildLogChars: log.length } }];"
+      },
+      "id": "retryprompt00001",
+      "name": "Write the retry prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        1080
+      ],
+      "notes": "Feeds the real Kaniko error back to the model. Exactly one retry - capped by construction, not by a counter that could drift."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.dockerPrompt }}"
+      },
+      "id": "regendockerfile1",
+      "name": "Generate a Dockerfile (retry)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2320,
+        1080
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "groqApiCred0001",
+          "name": "Groq API"
+        }
+      },
+      "notes": "Second and final generation attempt."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the Dockerfile, validate it, and build the Kaniko Job body.\n// The model is asked for raw text, but a model that ignores that and\n// wraps its answer in ``` fences must not be able to produce a broken\n// build - so the fences are stripped rather than trusted not to appear.\nconst a = $('Analyse repo').first().json;\nconst v = $('Validate input').first().json;\nconst attempt = 2;\n\nlet text = '';\ntry {\n  const r = $('Generate a Dockerfile (retry)').first().json;\n  text = String(r?.choices?.[0]?.message?.content ?? '');\n} catch (e) { text = ''; }\n\n// Strip markdown fences and any leading prose before the first FROM.\ntext = text.replace(/```[a-zA-Z]*\\n?/g, '').replace(/```/g, '').trim();\nconst fromAt = text.search(/^\\s*FROM\\s+\\S+/mi);\nif (fromAt > 0) text = text.slice(fromAt);\n\n// VALIDATION. Anything that fails here means no build is attempted at\n// all - the tenant keeps the working starter rather than being handed a\n// build that cannot succeed.\nconst tooBig = text.length > 8192;\nconst hasFrom = /^\\s*FROM\\s+\\S+/mi.test(text);\nconst usable = Boolean(text) && hasFrom && !tooBig;\n\n// The port comes from the generated EXPOSE, exactly as it is read from a\n// human-written Dockerfile. If the model omitted it we fall back to 80\n// and SAY SO through portSource, never silently.\nlet aiPort = 80, aiPortSource = 'default';\nconst m = text.match(/^\\s*EXPOSE\\s+([0-9]{2,5})/mi);\nif (m) { aiPort = parseInt(m[1], 10); aiPortSource = 'dockerfile'; }\n\nconst stamp = Math.floor(Date.now() / 1000);\nconst jobName = ('ai' + attempt + '-' + v.namespace + '-' + stamp).slice(0, 60);\nconst imageRef = '10.43.200.50:5000/' + v.namespace + '/app:ai' + attempt + '-' + stamp;\n\n// THE SANDBOX IS IDENTICAL TO THE HUMAN-WRITTEN PATH. Same namespace,\n// same `builder` service account, same dropped capabilities, same\n// resource limits, same NetworkPolicy. An AI-authored Dockerfile gets no\n// special treatment and no special trust - the pipeline already builds\n// arbitrary Dockerfiles written by strangers on public GitHub.\n//\n// The ONLY difference is delivery: an init container writes the\n// generated text into an emptyDir and kaniko reads it by absolute path.\n// Hand-proved before this was written; needs no extra RBAC. Its requests\n// are tiny so the pod's effective request stays 512Mi and the build\n// namespace still admits exactly two concurrent builds.\nconst bodyAiBuild = JSON.stringify({\n  apiVersion: 'batch/v1', kind: 'Job',\n  metadata: { name: jobName, labels: { tenant: v.username, aibuild: 'yes' } },\n  spec: {\n    // 900s, the SAME bound the human-written path uses. 420s was my\n    // number and it killed two perfectly good Dockerfiles: the\n    // hand-proof of this very build took 552s at this uplink.\n    activeDeadlineSeconds: 900,\n    backoffLimit: 0,\n    ttlSecondsAfterFinished: 3600,\n    template: {\n      metadata: { labels: { app: 'kaniko-build', tenant: v.username } },\n      spec: {\n        restartPolicy: 'Never',\n        serviceAccountName: 'builder',\n        automountServiceAccountToken: false,\n        securityContext: { seccompProfile: { type: 'RuntimeDefault' } },\n        volumes: [{ name: 'gen', emptyDir: {} }],\n        initContainers: [{\n          name: 'write-dockerfile',\n          image: 'busybox:1.36',\n          command: ['sh', '-c', 'printf %s \"$DOCKERFILE\" > /gen/Dockerfile'],\n          env: [{ name: 'DOCKERFILE', value: text }],\n          volumeMounts: [{ name: 'gen', mountPath: '/gen' }],\n          resources: { requests: { cpu: '10m', memory: '16Mi' },\n                       limits: { cpu: '100m', memory: '64Mi' } }\n        }],\n        containers: [{\n          name: 'kaniko',\n          image: 'gcr.io/kaniko-project/executor:v1.23.2',\n          args: [\n            '--context=git://github.com/' + v.owner + '/' + v.repo +\n              '.git#refs/heads/' + a.defaultBranch,\n            '--dockerfile=/gen/Dockerfile',\n            '--destination=' + imageRef,\n            '--insecure', '--skip-tls-verify', '--single-snapshot',\n            '--verbosity=info'\n          ],\n          securityContext: {\n            privileged: false, allowPrivilegeEscalation: false,\n            capabilities: { drop: ['ALL'], add: ['CHOWN','FOWNER','DAC_OVERRIDE'] }\n          },\n          volumeMounts: [{ name: 'gen', mountPath: '/gen' }],\n          resources: { requests: { cpu: '300m', memory: '512Mi' },\n                       limits: { cpu: '1', memory: '1Gi' } }\n        }]\n      }\n    }\n  }\n});\n\nreturn [{ json: { ...a, attempt, dockerfile: text, usable, hasFrom, tooBig,\n  aiPort, aiPortSource, aiJobName: jobName, aiImageRef: imageRef,\n  bodyAiBuild } }];"
+      },
+      "id": "checkretryfile01",
+      "name": "Check the retry Dockerfile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2500,
+        1080
+      ],
+      "notes": "Identical validation and sandbox to attempt 1 - written once, reused, so the two attempts cannot drift apart."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.bodyAiBuild }}"
+      },
+      "id": "startaibuild0002",
+      "name": "Start AI build (retry)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2680,
+        1080
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "waitaibuild00002",
+      "name": "Give the retry time",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "waitaibuild00002-hook",
+      "position": [
+        2860,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs/{{ $('Check the retry Dockerfile').first().json.aiJobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "checkaibuild0002",
+      "name": "Check retry build status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3040,
+        1080
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "retryok000000001-c",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.status && $json.status.succeeded > 0 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "retryok000000001",
+      "name": "Retry succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3220,
+        1080
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Whichever attempt succeeded supplies the image and the port. Reading\n// it from the winning attempt's own record - rather than assuming the\n// second - keeps the two paths from silently diverging.\nlet src = null;\ntry { src = $('Check the retry Dockerfile').first().json; } catch (e) { src = null; }\nif (!src || !src.aiImageRef) {\n  try { src = $('Check the generated Dockerfile').first().json; } catch (e) { src = null; }\n}\nconst v = $('Validate input').first().json;\n\n// UPGRADE IN PLACE. The built image goes into the SAME Deployment the\n// starter created - same name, same labels - so this is a rolling update\n// of one object rather than a Service selector moving between two\n// Deployments. That is Part 23 item 16's recommended fix, applied here\n// from the start: the starter keeps serving until the built pod is\n// Ready, so a slow or broken pull cannot take the site down.\nconst bodyUpgrade = JSON.stringify({\n  apiVersion: 'apps/v1', kind: 'Deployment',\n  metadata: { name: 'starter', labels: { app: 'starter', 'built-by': 'kaniko-ai' } },\n  spec: {\n    replicas: 1,\n    selector: { matchLabels: { app: 'starter' } },\n    template: {\n      metadata: { labels: { app: 'starter' } },\n      spec: { containers: [{\n        name: 'app', image: src.aiImageRef, imagePullPolicy: 'IfNotPresent',\n        resources: { requests: { cpu: '50m', memory: '64Mi' },\n                     limits: { cpu: '500m', memory: '512Mi' } }\n      }] }\n    }\n  }\n});\n\n// The Service must follow the generated EXPOSE, or the tenant gets a\n// link that 502s - the exact failure of Problem #130.\nconst bodyUpgradeSvc = JSON.stringify({\n  apiVersion: 'v1', kind: 'Service',\n  metadata: { name: 'site-k8s', labels: { 'provisioned-by': 'n8n' } },\n  spec: { selector: { app: 'starter' },\n    ports: [{ name: 'http', port: 80, targetPort: src.aiPort || 80 }] }\n});\n\n// --- the Nomad form of the same win --------------------------------\n// Nomad pulls over the LAN address; Kaniko pushed to the ClusterIP.\n// Same image, same digest, two doors (as the human-built path does).\nconst a = $('Analyse repo').first().json;\nconst nomadAiImage = String(src.aiImageRef || '')\n  .replace('10.43.200.50:5000', '192.168.1.50:5000');\n\n// Same job ID as the starter, so this REPLACES it rather than running\n// a second workload beside it. The port comes from the generated\n// EXPOSE, and the restart policy is the one from Problem #133 - Nomad\n// gives up after 2 attempts by default and would die permanently on a\n// pull that is momentarily unavailable.\nconst bodyNomadAiJob = JSON.stringify({\n  Job: {\n    ID: a.nomadJobId, Name: a.nomadJobId, Type: 'service',\n    Namespace: a.nomadNamespace, Datacenters: ['*'],\n    TaskGroups: [{\n      Name: 'app', Count: 1,\n      Networks: [{ DynamicPorts: [{ Label: 'http', To: src.aiPort || 80 }] }],\n      RestartPolicy: { Attempts: 20, Interval: 3600000000000,\n                       Delay: 20000000000, Mode: 'delay' },\n      Tasks: [{\n        Name: 'app', Driver: 'docker',\n        Config: { image: nomadAiImage, ports: ['http'] },\n        Resources: { CPU: 200, MemoryMB: 256 }\n      }]\n    }]\n  }\n});\n\nreturn [{ json: { namespace: v.namespace, aiImageRef: src.aiImageRef,\n  aiPort: src.aiPort, aiPortSource: src.aiPortSource, attempt: src.attempt,\n  bodyUpgrade, bodyUpgradeSvc, bodyNomadAiJob, nomadAiImage,\n  nomadJobId: a.nomadJobId, nomadNamespace: a.nomadNamespace,\n  isNomad: $('Pick from fixed menu').first().json.choice === 'nomad' } }];"
+      },
+      "id": "pickaiimage00001",
+      "name": "Which build won?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        900
+      ],
+      "notes": "Applies the built image to the SAME Deployment as the starter - a rolling update, so the working site is never taken down by the upgrade (Part 23 item 16)."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/apps/v1/namespaces/{{ $json.namespace }}/deployments/starter?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $json.bodyUpgrade }}"
+      },
+      "id": "applyupgrade0001",
+      "name": "Upgrade the site to the built image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3580,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "waitupgrade00001",
+      "name": "Let the new pod come up",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "waitupgrade00001-hook",
+      "position": [
+        3760,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Which build won?').first().json.namespace }}/services/site-k8s?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Which build won?').first().json.bodyUpgradeSvc }}"
+      },
+      "id": "applyupgradesvc1",
+      "name": "Point the Service at the built port",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3940,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "tryaidocker00001-c",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Analyse repo').first().json.repoAnalysed && !$('Analyse repo').first().json.hasDockerfile && ($('Pick from fixed menu').first().json.choice === 'kubernetes' || $('Pick from fixed menu').first().json.choice === 'nomad') }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "tryaidocker00001",
+      "name": "Try an AI Dockerfile?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        700,
+        1080
+      ],
+      "notes": "Generates ONLY when the repo was actually read AND ships no Dockerfile (case-insensitive, #143). If the GitHub listing failed we cannot know, so we do not generate - a missing answer is not a negative one."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "notimeout",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ JSON.stringify($json.status || {}).indexOf('DeadlineExceeded') === -1 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "worthretry000001",
+      "name": "Worth a second try?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        900
+      ],
+      "notes": "A timeout is not a Dockerfile defect. Retrying one wastes the single retry and a build slot, and would very likely time out again for the same reason."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "aibuildsettled01-c",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && (($json.status.succeeded || 0) > 0 || ($json.status.failed || 0) > 0)) || $runIndex >= 52 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "aibuildsettled01",
+      "name": "Build settled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1690,
+        900
+      ],
+      "notes": "Loops back to the wait until the Job has genuinely succeeded or failed. Capped at 35 passes by $runIndex so a check that errors every time cannot spin forever."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "retrysettled00001-c",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && (($json.status.succeeded || 0) > 0 || ($json.status.failed || 0) > 0)) || $runIndex >= 52 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "retrysettled00001",
+      "name": "Retry settled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3130,
+        1080
+      ],
+      "notes": "Loops back to the wait until the Job has genuinely succeeded or failed. Capped at 35 passes by $runIndex so a check that errors every time cannot spin forever."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "aiisnomad",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.isNomad }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "aiplatformwon001",
+      "name": "Which platform won?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3580,
+        1080
+      ],
+      "notes": "The image is built the same way for both platforms; only how it is DEPLOYED differs."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://192.168.1.51:4646/v1/jobs?namespace={{ $json.nomadNamespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.bodyNomadAiJob }}"
+      },
+      "id": "ainomadsubmit001",
+      "name": "Submit Nomad job (AI image)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3760,
+        1260
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "notes": "Replaces the http-echo starter with the tenant's own AI-built image, same job ID."
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "ainomadwait00001",
+      "name": "Wait for the AI allocation",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "ai-nomad-wait-hook",
+      "position": [
+        3940,
+        1260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://192.168.1.51:4646/v1/job/{{ $('Which build won?').first().json.nomadJobId }}/allocations?namespace={{ $('Which build won?').first().json.nomadNamespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ainomadlist00001",
+      "name": "List AI allocations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4120,
+        1260
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "notes": "The list endpoint carries no AllocatedResources - the detail fetch below is required."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The job was just REPLACED, so its old allocation is still listed\n// alongside the new one and carries the OLD port. Newest-running-first,\n// exactly as the starter path does - picking wrongly would wire the\n// tenant to a port nothing listens on.\nlet allocs = [];\ntry { allocs = $input.all().map(i => i.json).filter(x => x && x.ID); }\ncatch (e) { allocs = []; }\nconst running = allocs.filter(x => x.ClientStatus === 'running');\nconst pool = running.length ? running : allocs;\npool.sort((x, y) => (y.CreateIndex || 0) - (x.CreateIndex || 0));\nconst chosen = pool[0] || null;\nreturn [{ json: { allocId: chosen ? chosen.ID : '',\n  allocStatus: chosen ? chosen.ClientStatus : null,\n  havePlacement: Boolean(chosen && chosen.ClientStatus === 'running') } }];"
+      },
+      "id": "ainomadpick00001",
+      "name": "Pick the AI allocation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4300,
+        1260
+      ],
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://192.168.1.51:4646/v1/allocation/{{ $json.allocId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ainomadread00001",
+      "name": "Read the AI allocation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4480,
+        1260
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "aiallocok",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.AllocatedResources && $json.AllocatedResources.Shared && ($json.AllocatedResources.Shared.Ports || []).length > 0) || $runIndex >= 20 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ainomadsettled01",
+      "name": "AI allocation placed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4660,
+        1260
+      ],
+      "notes": "Polls until Nomad has actually allocated a port. Capped at 21 passes so a job that never places cannot spin forever."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ONLY the EndpointSlice changes. `site-nomad-svc` and the Ingress were\n// created by this submission's starter path and an image swap does not\n// touch either - re-applying them would be noise that could mask a real\n// change. The port is READ from the new allocation, never carried over.\nconst wb = $('Which build won?').first().json;\nconst alloc = $input.first().json || {};\n\nlet host = null, port = null;\ntry {\n  const ports = ((alloc.AllocatedResources || {}).Shared || {}).Ports || [];\n  const p = ports.find(x => x.Label === 'http') || ports[0];\n  if (p) { host = p.HostIP || null; port = p.Value || null; }\n} catch (e) { host = null; port = null; }\nconst haveAddr = Boolean(host && port);\n\nconst bodyAiSlice = JSON.stringify({\n  apiVersion: 'discovery.k8s.io/v1', kind: 'EndpointSlice',\n  metadata: { name: 'site-nomad',\n    labels: { 'kubernetes.io/service-name': 'site-nomad-svc',\n              'provisioned-by': 'n8n' } },\n  addressType: 'IPv4',\n  ports: [{ name: 'http', port: port || 0, protocol: 'TCP' }],\n  endpoints: [{ addresses: [host || '0.0.0.0'], conditions: { ready: haveAddr } }]\n});\n\nreturn [{ json: { namespace: wb.namespace, haveAddr, nomadHost: host,\n  nomadPort: port, aiImageRef: wb.nomadAiImage, bodyAiSlice } }];"
+      },
+      "id": "ainomadroute0001",
+      "name": "Point Nomad at the AI image",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4840,
+        1260
+      ],
+      "notes": "Re-applies only the EndpointSlice, with the port read from the new allocation."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/apis/discovery.k8s.io/v1/namespaces/{{ $json.namespace }}/endpointslices/site-nomad?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $json.bodyAiSlice }}"
+      },
+      "id": "ainomadslice0001",
+      "name": "Route Nomad to the AI image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5020,
+        1260
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Validate input').first().json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "readnamespace001",
+      "name": "Read the namespace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -40,
+        40
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "Read back after create OR 409 - a 409 body carries no labels, so ownership can only be established by looking."
+    },
+    {
+      "parameters": {
+        "jsCode": "// WHO OWNS THIS NAMESPACE? The whole point of Phase 1.\n//\n// `owner` is written by every submission from now on. Namespaces created\n// before this change carry only `tenant`, so both are read - a legacy\n// tenant must not be locked out of their own project.\n//\n// FAIL CLOSED. If ownership cannot be established at all - no labels, or\n// the namespace could not be read - we do NOT proceed. Deploying into a\n// namespace whose owner is unknown is exactly the failure this check\n// exists to prevent, and 'unknown' is not 'mine'.\nconst v = $('Validate input').first().json;\nlet labels = null, readable = false;\ntry {\n  const j = $input.first().json;\n  if (j && j.kind === 'Namespace' && j.metadata) {\n    labels = j.metadata.labels || {};\n    readable = true;\n  }\n} catch (e) { labels = null; }\n\nconst owner = labels ? (labels.owner || labels.tenant || '') : '';\nconst ours = readable && owner === v.username;\n\n// A namespace with no ownership label at all is not assumed to be ours.\nconst nameTaken = readable && !ours;\nconst ownerUnknown = !readable || !owner;\n\nreturn [{ json: { ...v, nsOwner: owner, ours, nameTaken, ownerUnknown,\n  nsReadable: readable } }];"
+      },
+      "id": "ownercheck000001",
+      "name": "Is it ours to use?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        140,
+        40
+      ],
+      "notes": "Fails CLOSED: an unreadable or unlabelled namespace is not treated as ours."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "isours",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.ours }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "oursgate00000001",
+      "name": "Ours?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        320,
+        40
+      ],
+      "notes": "The refusal path exists so a name collision ends with an honest answer, never a deployment into someone else's namespace."
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "give-the-repo-build-time",
+      "name": "Give the repo build time",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2400,
+        1500
+      ],
+      "webhookId": "give-the-repo-build-time",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs/{{ $('Analyse repo').first().json.jobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "check-repo-build-status",
+      "name": "Check repo build status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2620,
+        1500
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "repobuildsettled01",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && ((($json.status.succeeded || 0) > 0) || (($json.status.failed || 0) > 0))) || $runIndex >= 52 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "repo-build-settled?",
+      "name": "Repo build settled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        1500
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "repobuildok01",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && ($json.status.succeeded || 0) > 0) }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "repo-build-succeeded?",
+      "name": "Repo build succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3060,
+        1440
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/apps/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/deployments/starter?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "method": "PATCH",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Analyse repo').first().json.bodyRepoUpgrade }}"
+      },
+      "id": "upgrade-to-the-repo-image",
+      "name": "Upgrade to the repo image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3280,
+        1400
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "give-the-nomad-build-time",
+      "name": "Give the Nomad build time",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2400,
+        1900
+      ],
+      "webhookId": "give-the-nomad-build-time",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/apis/batch/v1/namespaces/build/jobs/{{ $('Analyse repo').first().json.nomadJobName }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "check-nomad-build-status",
+      "name": "Check Nomad build status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2620,
+        1900
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "nomadbuildsettled1",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && ((($json.status.succeeded || 0) > 0) || (($json.status.failed || 0) > 0))) || $runIndex >= 52 }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "nomad-build-settled?",
+      "name": "Nomad build settled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        1900
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "nomadbuildok01",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ ($json.status && ($json.status.succeeded || 0) > 0) }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "nomad-build-succeeded?",
+      "name": "Nomad build succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3060,
+        1840
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "let-the-repo-pod-come-up",
+      "name": "Let the repo pod come up",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3500,
+        1400
+      ],
+      "webhookId": "let-the-repo-pod-come-up",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $('Analyse repo').first().json.namespace }}/services/site-k8s?fieldManager=n8n&force=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/apply-patch+yaml",
+        "body": "={{ $('Analyse repo').first().json.bodyRepoUpgradeSvc }}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "point-the-service-at-the-repo",
+      "name": "Point the Service at the repo port",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3720,
+        1400
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Submission from portal": {
+      "main": [
+        [
+          {
+            "node": "Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate input": {
+      "main": [
+        [
+          {
+            "node": "Has a GitHub repo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify with Groq": {
+      "main": [
+        [
+          {
+            "node": "Pick from fixed menu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick from fixed menu": {
+      "main": [
+        [
+          {
+            "node": "Create namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create namespace": {
+      "main": [
+        [
+          {
+            "node": "Read the namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create quota": {
+      "main": [
+        [
+          {
+            "node": "Bind tenant identity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bind tenant identity": {
+      "main": [
+        [
+          {
+            "node": "Nomad was chosen?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs a k8s workload?": {
+      "main": [
+        [
+          {
+            "node": "Create starter deployment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nomad was chosen?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create starter deployment": {
+      "main": [
+        [
+          {
+            "node": "Decide site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build result": {
+      "main": [
+        [
+          {
+            "node": "Respond to portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has a GitHub repo?": {
+      "main": [
+        [
+          {
+            "node": "Repo languages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Analyse repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo languages": {
+      "main": [
+        [
+          {
+            "node": "Repo readme",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo readme": {
+      "main": [
+        [
+          {
+            "node": "Repo contents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo contents": {
+      "main": [
+        [
+          {
+            "node": "Repo dockerfile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyse repo": {
+      "main": [
+        [
+          {
+            "node": "Explicit choice?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo has a Dockerfile?": {
+      "main": [
+        [
+          {
+            "node": "Start image build",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs a k8s workload?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start image build": {
+      "main": [
+        [
+          {
+            "node": "Give the build a moment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give the build a moment": {
+      "main": [
+        [
+          {
+            "node": "Check build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check build status": {
+      "main": [
+        [
+          {
+            "node": "Did a build pod start?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nomad was chosen?": {
+      "main": [
+        [
+          {
+            "node": "Namespace to create",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Repo has a Dockerfile?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Nomad job": {
+      "main": [
+        [
+          {
+            "node": "Give Nomad a moment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can we build for Nomad?": {
+      "main": [
+        [
+          {
+            "node": "Start image build for Nomad",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Submit Nomad job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start image build for Nomad": {
+      "main": [
+        [
+          {
+            "node": "Submit Nomad job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Nomad job (built image)": {
+      "main": [
+        [
+          {
+            "node": "Give Nomad a moment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo dockerfile": {
+      "main": [
+        [
+          {
+            "node": "Analyse repo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide site": {
+      "main": [
+        [
+          {
+            "node": "Create service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create service": {
+      "main": [
+        [
+          {
+            "node": "Create ingress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create ingress": {
+      "main": [
+        [
+          {
+            "node": "Build result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Did a build pod start?": {
+      "main": [
+        [
+          {
+            "node": "Build has a pod?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build has a pod?": {
+      "main": [
+        [
+          {
+            "node": "Create starter deployment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create starter deployment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explicit choice?": {
+      "main": [
+        [
+          {
+            "node": "Pick from fixed menu",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify with Groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give Nomad a moment": {
+      "main": [
+        [
+          {
+            "node": "List Nomad allocations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Nomad allocations": {
+      "main": [
+        [
+          {
+            "node": "Pick the live allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick the live allocation": {
+      "main": [
+        [
+          {
+            "node": "Read Nomad allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Nomad allocation": {
+      "main": [
+        [
+          {
+            "node": "Decide Nomad site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Nomad site": {
+      "main": [
+        [
+          {
+            "node": "Create nomad service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create nomad service": {
+      "main": [
+        [
+          {
+            "node": "Create nomad endpoints",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create nomad endpoints": {
+      "main": [
+        [
+          {
+            "node": "Create nomad ingress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create nomad ingress": {
+      "main": [
+        [
+          {
+            "node": "Build result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure Nomad namespace": {
+      "main": [
+        [
+          {
+            "node": "Can we build for Nomad?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Namespace to create": {
+      "main": [
+        [
+          {
+            "node": "Ensure Nomad namespace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to portal": {
+      "main": [
+        [
+          {
+            "node": "Try an AI Dockerfile?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Give the repo build time",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Give the Nomad build time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Try an AI Dockerfile?": {
+      "main": [
+        [
+          {
+            "node": "Repo manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo manifest": {
+      "main": [
+        [
+          {
+            "node": "Write the Dockerfile prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the Dockerfile prompt": {
+      "main": [
+        [
+          {
+            "node": "Generate a Dockerfile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate a Dockerfile": {
+      "main": [
+        [
+          {
+            "node": "Check the generated Dockerfile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check the generated Dockerfile": {
+      "main": [
+        [
+          {
+            "node": "Start AI build",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start AI build": {
+      "main": [
+        [
+          {
+            "node": "Give the AI build time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give the AI build time": {
+      "main": [
+        [
+          {
+            "node": "Check AI build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check AI build status": {
+      "main": [
+        [
+          {
+            "node": "Build settled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI build succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Which build won?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Worth a second try?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the build error": {
+      "main": [
+        [
+          {
+            "node": "Read the build log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the build log": {
+      "main": [
+        [
+          {
+            "node": "Write the retry prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the retry prompt": {
+      "main": [
+        [
+          {
+            "node": "Generate a Dockerfile (retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate a Dockerfile (retry)": {
+      "main": [
+        [
+          {
+            "node": "Check the retry Dockerfile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check the retry Dockerfile": {
+      "main": [
+        [
+          {
+            "node": "Start AI build (retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start AI build (retry)": {
+      "main": [
+        [
+          {
+            "node": "Give the retry time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give the retry time": {
+      "main": [
+        [
+          {
+            "node": "Check retry build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check retry build status": {
+      "main": [
+        [
+          {
+            "node": "Retry settled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Which build won?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Which build won?": {
+      "main": [
+        [
+          {
+            "node": "Which platform won?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upgrade the site to the built image": {
+      "main": [
+        [
+          {
+            "node": "Let the new pod come up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Let the new pod come up": {
+      "main": [
+        [
+          {
+            "node": "Point the Service at the built port",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth a second try?": {
+      "main": [
+        [
+          {
+            "node": "Read the build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build settled?": {
+      "main": [
+        [
+          {
+            "node": "AI build succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give the AI build time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry settled?": {
+      "main": [
+        [
+          {
+            "node": "Retry succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give the retry time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Which platform won?": {
+      "main": [
+        [
+          {
+            "node": "Submit Nomad job (AI image)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upgrade the site to the built image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Nomad job (AI image)": {
+      "main": [
+        [
+          {
+            "node": "Wait for the AI allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for the AI allocation": {
+      "main": [
+        [
+          {
+            "node": "List AI allocations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List AI allocations": {
+      "main": [
+        [
+          {
+            "node": "Pick the AI allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick the AI allocation": {
+      "main": [
+        [
+          {
+            "node": "Read the AI allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the AI allocation": {
+      "main": [
+        [
+          {
+            "node": "AI allocation placed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI allocation placed?": {
+      "main": [
+        [
+          {
+            "node": "Point Nomad at the AI image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait for the AI allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Point Nomad at the AI image": {
+      "main": [
+        [
+          {
+            "node": "Route Nomad to the AI image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read the namespace": {
+      "main": [
+        [
+          {
+            "node": "Is it ours to use?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it ours to use?": {
+      "main": [
+        [
+          {
+            "node": "Ours?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ours?": {
+      "main": [
+        [
+          {
+            "node": "Create quota",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give the repo build time": {
+      "main": [
+        [
+          {
+            "node": "Check repo build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check repo build status": {
+      "main": [
+        [
+          {
+            "node": "Repo build settled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo build settled?": {
+      "main": [
+        [
+          {
+            "node": "Repo build succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give the repo build time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repo build succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Upgrade to the repo image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Give the Nomad build time": {
+      "main": [
+        [
+          {
+            "node": "Check Nomad build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Nomad build status": {
+      "main": [
+        [
+          {
+            "node": "Nomad build settled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nomad build settled?": {
+      "main": [
+        [
+          {
+            "node": "Nomad build succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give the Nomad build time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nomad build succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Submit Nomad job (built image)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Upgrade to the repo image": {
+      "main": [
+        [
+          {
+            "node": "Let the repo pod come up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Let the repo pod come up": {
+      "main": [
+        [
+          {
+            "node": "Point the Service at the repo port",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Point the Service at the repo port": {
+      "main": [
+        []
+      ]
+    }
+  }
+}

@@ -1,0 +1,91 @@
+https:
+  enabled: true
+
+config:
+  issuer: https://dex.dex.svc.cluster.local:5554/dex
+  oauth2:
+    passwordConnector: freeipa
+
+  storage:
+    type: kubernetes
+    config:
+      inCluster: true
+
+  web:
+    https: 0.0.0.0:5554
+    tlsCert: /etc/dex/tls-web/tls.crt
+    tlsKey: /etc/dex/tls-web/tls.key
+
+  connectors:
+  - type: ldap
+    id: freeipa
+    name: FreeIPA
+    config:
+      host: freeipa.cloudlab.internal:636
+      insecureNoSSL: false
+      insecureSkipVerify: false
+      rootCA: /etc/dex/tls/ca.crt
+      bindDN: uid=dex-bind,cn=users,cn=accounts,dc=cloudlab,dc=internal
+      bindPW: "PLACEHOLDER-SET-BY-deploy-dex.sh"
+      usernamePrompt: Username
+      userSearch:
+        baseDN: cn=users,cn=accounts,dc=cloudlab,dc=internal
+        filter: "(objectClass=person)"
+        username: uid
+        preferredUsernameAttr: uid
+        idAttr: uid
+        emailAttr: mail
+        nameAttr: cn
+      groupSearch:
+        baseDN: cn=groups,cn=accounts,dc=cloudlab,dc=internal
+        filter: "(objectClass=groupofnames)"
+        userMatchers:
+        - userAttr: DN
+          groupAttr: member
+        nameAttr: cn
+
+  staticClients:
+  - id: kubernetes
+    name: Kubernetes
+    secret: kube-dex-client-secret-2026
+    redirectURIs:
+    - http://localhost:8000
+    - http://localhost:18000
+  - id: nomad
+    name: Nomad
+    secret: deQ-i1g2DDwoV68vrT-yECs9PfiE4_CX4AiNQlla0iE
+    redirectURIs:
+    - http://localhost:4649/oidc/callback
+    - http://192.168.1.51:4646/oidc/callback
+    - http://192.168.1.51:4646/ui/settings/tokens
+  - id: signup-portal
+    name: CloudLab Portal
+    # Real value injected at deploy time by deploy-dex.sh, from Vault
+    # at cloudlab/signup-portal-oidc. Same pattern as bindPW: the
+    # secret is never written to this file.
+    secret: PLACEHOLDER-SET-BY-deploy-dex.sh
+    # Unused: this client authenticates by PASSWORD GRANT only, so no
+    # redirect ever happens. Present because both working clients have
+    # one, and a config Dex rejects at startup takes down k8s AND Nomad.
+    redirectURIs:
+    - http://signup.cloudlab.internal/oidc/callback
+  - id: grafana
+    name: Grafana
+    secret: PLACEHOLDER-SET-BY-deploy-dex.sh
+    redirectURIs:
+    - http://grafana.cloudlab.internal/login/generic_oauth
+volumes:
+- name: freeipa-ca
+  secret:
+    secretName: freeipa-ca
+- name: dex-tls
+  secret:
+    secretName: dex-tls
+
+volumeMounts:
+- name: freeipa-ca
+  mountPath: /etc/dex/tls
+  readOnly: true
+- name: dex-tls
+  mountPath: /etc/dex/tls-web
+  readOnly: true

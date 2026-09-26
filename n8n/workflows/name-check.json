@@ -1,0 +1,224 @@
+{
+  "id": "projNameCheck001",
+  "name": "Project Name Availability",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "nameTrigger00001",
+      "name": "Called by the portal",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        -220,
+        240
+      ],
+      "notes": "Input: { name, username }. Answers whether a project name can be claimed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shape and reserved words first - both are free to check and neither\n// needs the cluster. If a name fails here there is nothing to look up.\n//\n// THIS LIST MUST MATCH `Validate input` in the provisioning workflow.\n// They are separate copies because the two workflows are separate, and\n// wfcheck.js asserts they are identical - a name this check calls free\n// but the provisioner then rejects would be the worst of both.\nconst RESERVED = [\n  'default', 'kube-system', 'kube-public', 'kube-node-lease',\n  'build', 'registry', 'monitoring', 'signup', 'n8n', 'dex', 'vault',\n  'user1', 'user2',\n  'www', 'api', 'admin', 'apps', 'auth', 'login', 'portal', 'mail',\n  'ns1', 'static', 'cdn', 'root', 'system'\n];\n\n// Two triggers, two shapes: a webhook nests the payload under .body,\n// the Execute Workflow trigger passes the item as-is. Accept both so\n// the rules below never depend on how the question arrived.\nconst raw = $input.first().json || {};\nconst inp = raw.body || raw;\nconst name = String(inp.name || '').trim().toLowerCase();\nconst username = String(inp.username || '').trim().toLowerCase();\n\nlet ok = true, reason = '';\nif (!/^[a-z][a-z0-9-]{1,28}[a-z0-9]$/.test(name)) {\n  ok = false; reason = 'shape';\n} else if (name.indexOf('--') !== -1) {\n  ok = false; reason = 'shape';\n} else if (RESERVED.indexOf(name) !== -1) {\n  ok = false; reason = 'reserved';\n} else if (/^(kube-|proj-|tenant-)/.test(name)) {\n  ok = false; reason = 'reserved';\n}\n\n// The namespace name is the uniqueness key: a tenant's hostname is\n// derived from it, so a free namespace means a free name. That is why\n// no Ingress listing is needed here - and why n8n needs no extra RBAC.\nreturn [{ json: { name, username, shapeOk: ok, reason,\n  namespace: 'tenant-' + name } }];"
+      },
+      "id": "nameShape0000001",
+      "name": "Is the name usable at all?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://kubernetes.default.svc/api/v1/namespaces/{{ $json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "nameK8sCheck0001",
+      "name": "Taken on Kubernetes?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        140,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "kubeApiCred0001",
+          "name": "Kubernetes API"
+        }
+      },
+      "notes": "404 means free. A 200 also tells us WHO owns it, so the portal can say 'that is already yours' rather than 'taken'."
+    },
+    {
+      "parameters": {
+        "url": "=http://192.168.1.51:4646/v1/namespace/{{ $('Is the name usable at all?').first().json.namespace }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "nameNomadCheck01",
+      "name": "Taken on Nomad?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nomadApiCred001",
+          "name": "Nomad API"
+        }
+      },
+      "notes": "Both platforms share one hostname space, so a name taken on either is taken."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One answer, and it never guesses. If a lookup could not be completed\n// the name is reported as UNKNOWN rather than free: telling a user a\n// name is available and then refusing it at submit time is worse than\n// asking them to try again.\nconst n = $('Is the name usable at all?').first().json;\n\nfunction seen(nodeName) {\n  // true  = the object exists (name taken)\n  // false = a clean 404 (name free)\n  // null  = we could not tell\n  try {\n    const j = $(nodeName).first().json;\n    if (!j) return null;\n    if (j.kind === 'Namespace' && j.metadata) return true;      // k8s hit\n    if (j.Name) return true;                                    // nomad hit\n    const s = JSON.stringify(j);\n    if (s.indexOf('NotFound') !== -1 || s.indexOf('404') !== -1) return false;\n    if (s.indexOf('not found') !== -1) return false;\n    return null;\n  } catch (e) { return null; }\n}\n\nlet ownedBy = '';\ntry {\n  const k = $('Taken on Kubernetes?').first().json;\n  if (k && k.metadata && k.metadata.labels) {\n    ownedBy = k.metadata.labels.owner || k.metadata.labels.tenant || '';\n  }\n} catch (e) { ownedBy = ''; }\n\nconst k8s = seen('Taken on Kubernetes?');\nconst nomad = seen('Taken on Nomad?');\n\nlet available = false, reason = n.reason;\nif (!n.shapeOk) {\n  available = false;                       // reason already set\n} else if (k8s === null || nomad === null) {\n  available = false; reason = 'unknown';\n} else if (k8s || nomad) {\n  available = false;\n  reason = (ownedBy && ownedBy === n.username) ? 'yours' : 'taken';\n} else {\n  available = true; reason = 'free';\n}\n\nreturn [{ json: { name: n.name, available, reason,\n  ownedByYou: reason === 'yours', namespace: n.namespace } }];"
+      },
+      "id": "nameAnswer000001",
+      "name": "Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        240
+      ],
+      "notes": "reason: free | taken | yours | reserved | shape | unknown. Never reports free when a lookup failed."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "name-available",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "nameHook00000001",
+      "name": "Asked by the portal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "webhookId": "name-available-hook",
+      "position": [
+        -220,
+        420
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "portalHookCred01",
+          "name": "Portal Webhook Token"
+        }
+      },
+      "notes": "Same header auth as the provisioning webhook. The portal is the only caller."
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "id": "nameRespond00001",
+      "name": "Answer the portal",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        680,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Only meaningful on the webhook path; harmless when invoked as a sub-workflow."
+    }
+  ],
+  "connections": {
+    "Called by the portal": {
+      "main": [
+        [
+          {
+            "node": "Is the name usable at all?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is the name usable at all?": {
+      "main": [
+        [
+          {
+            "node": "Taken on Kubernetes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Taken on Kubernetes?": {
+      "main": [
+        [
+          {
+            "node": "Taken on Nomad?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Taken on Nomad?": {
+      "main": [
+        [
+          {
+            "node": "Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Asked by the portal": {
+      "main": [
+        [
+          {
+            "node": "Is the name usable at all?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer": {
+      "main": [
+        [
+          {
+            "node": "Answer the portal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

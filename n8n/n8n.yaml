@@ -1,0 +1,393 @@
+---
+# n8n — the provisioning automation layer.
+#
+# SEPARATE APP, SEPARATE NAMESPACE, by design. This is Part 23 item 7's
+# split trigger firing exactly as written: n8n needs egress the signup
+# portal must not have (the Kubernetes API, and Groq's API on the public
+# internet), and it must NOT hold svc-portal's FreeIPA credential.
+#
+# Hardening follows Part 16's Checkov-clean standard with TWO documented
+# exceptions, because n8n is a real Node.js application rather than a
+# stdlib script:
+#   - runs as UID 1000 (`node`), not 65534. The image's own user owns
+#     /home/node/.n8n and the SQLite database inside it.
+#   - readOnlyRootFilesystem: false. n8n writes its database, its
+#     encrypted credential store, and binary/temp data at runtime.
+# Everything else from Part 16 still applies: non-root, no privilege
+# escalation, all capabilities dropped, RuntimeDefault seccomp.
+#
+# It DOES mount a ServiceAccount token — unlike signup-portal, which sets
+# automountServiceAccountToken: false. That token IS the point here: it
+# is how n8n calls the Kubernetes API to provision tenants.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: n8n
+  labels:
+    name: n8n
+    tier: platform
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: n8n
+  namespace: n8n
+---
+# The tenant Role template, mirroring user1-full-access / user2-full-access
+# from Part 8 exactly. Created ONCE here by an admin rather than by n8n,
+# because n8n must not hold these permissions itself — see the ClusterRole
+# below for why that distinction is load-bearing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tenant-full-access
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources:
+      - pods
+      - deployments
+      - services
+      - replicasets
+      - jobs
+      - configmaps
+      - secrets
+      - persistentvolumeclaims
+      - pods/log
+      - pods/exec
+      - deployments/scale
+      - resourcequotas
+      - events
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# EVERY RULE BELOW WAS EARNED BY A REAL DENIAL, not guessed. The full
+# attempt/error/fix trail is in Part 22, "n8n RBAC — five rounds".
+#
+# Note what is NOT here: no secrets, no delete, no exec, no clusterrole
+# or clusterrolebinding creation, no nodes. Verified denied.
+#
+# KNOWN LIMITATION, NOT AN OVERSIGHT: a ClusterRoleBinding applies to
+# every namespace, and Kubernetes RBAC cannot express "only in namespaces
+# you created". So n8n CAN create a Deployment in `dex` or `vault`. No
+# rule here can prevent that; it needs an admission policy engine.
+# Recorded in Part 23 item 9.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: n8n-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create", "get"]
+  # `bind` is the whole reason n8n can grant tenants their Role without
+  # holding that Role's permissions itself. Without it, Kubernetes'
+  # privilege-escalation prevention refuses the RoleBinding, listing every
+  # permission n8n lacks — including `secrets`, which it must never have.
+  # Granting `escalate` instead would have "fixed" the error by defeating
+  # the point. resourceNames pins this to ONE role: binding cluster-admin
+  # is still refused.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["tenant-full-access"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: n8n-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: n8n-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: n8n
+    namespace: n8n
+---
+# Workflows AND the encrypted credential store live in SQLite under
+# /home/node/.n8n. Without this PVC both are lost on every restart.
+# local-path is k3s's default StorageClass; Vault already uses it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-data
+  namespace: n8n
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n
+  namespace: n8n
+spec:
+  selector:
+    app: n8n
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: n8n
+  labels:
+    app: n8n
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: the PVC is ReadWriteOnce and n8n's
+    # SQLite database must not be opened by two pods at once.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: n8n
+  template:
+    metadata:
+      labels:
+        app: n8n
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000          # `node`, owns /home/node/.n8n
+        runAsGroup: 1000
+        fsGroup: 1000            # makes the PVC writable by that user
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: n8n
+          image: n8nio/n8n:1.62.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5678
+          env:
+            # Losing this key makes every stored credential unreadable.
+            # Generated once by deploy-n8n.sh and never rotated on deploy.
+            - name: N8N_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: n8n-encryption
+                  key: key
+            - name: N8N_HOST
+              value: "n8n.cloudlab.internal"
+            - name: N8N_PORT
+              value: "5678"
+            - name: N8N_PROTOCOL
+              value: "http"
+            # n8n defaults to Secure-flagged session cookies, which the
+            # browser then refuses to send over plain HTTP — the setup
+            # page loads but cannot be completed.
+            #
+            # This lab's Ingresses are all plain HTTP (Grafana,
+            # signup-portal, both tenant portals), reached over an SSH
+            # tunnel. Serving TLS for n8n alone would make it the only
+            # HTTPS Ingress here and require trusting the FreeIPA CA in
+            # the browser, for no real gain: the protection is the tunnel
+            # plus the Traefik basic-auth middleware, not this flag.
+            #
+            # Honest cost: the n8n session cookie can now travel over
+            # plain HTTP. Acceptable on a tunnelled internal network.
+            # If n8n is ever exposed beyond that, serve TLS and remove
+            # this line — do not leave it set on a public surface.
+            - name: N8N_SECURE_COOKIE
+              value: "false"
+            - name: WEBHOOK_URL
+              value: "http://n8n.cloudlab.internal/"
+            - name: GENERIC_TIMEZONE
+              value: "Africa/Tunis"
+            # NOTE: N8N_BASIC_AUTH_* is NOT set here, deliberately.
+            # Those variables were REMOVED in n8n 1.x and are silently
+            # ignored — setting them produced an Editor UI that returned
+            # HTTP 200 to unauthenticated requests while looking
+            # configured. Auth is enforced at the Ingress instead, by the
+            # Traefik middleware below. See Problem #115.
+            # Trust the cluster CA so HTTP Request nodes can call the
+            # Kubernetes API with TLS VERIFICATION ON. The alternative —
+            # ticking "Ignore SSL Issues" per node — would disable
+            # verification silently and per-workflow, and this project's
+            # standing rule is that TLS is verified, always (Part 22).
+            # The CA is already mounted by the ServiceAccount token
+            # projection; this just points Node at it.
+            - name: NODE_EXTRA_CA_CERTS
+              value: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            - name: N8N_DIAGNOSTICS_ENABLED
+              value: "false"
+            - name: N8N_VERSION_NOTIFICATIONS_ENABLED
+              value: "false"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # documented exception
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 40
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 5678
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /home/node/.n8n
+      serviceAccountName: n8n
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: n8n-data
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: n8n
+  namespace: n8n
+spec:
+  podSelector:
+    matchLabels:
+      app: n8n
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Editor UI, via Traefik only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 5678
+    # Submissions from the signup portal.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: signup
+      ports:
+        - protocol: TCP
+          port: 5678
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The Kubernetes API — how n8n provisions tenants. This is the
+    # egress the signup portal must never have.
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: 192.168.1.50/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    # Nomad's HTTP API on .51 — tenant namespace, ACL policy and job
+    # submission. Added 2026-08-29.
+    #
+    # Needed explicitly because the public-internet rule below excludes
+    # all of RFC1918, which .51 is inside. Port 4646 ONLY.
+    #
+    # Consul (:8500) is deliberately NOT opened: Nomad registers services
+    # in Consul itself from the job's own `service` block, so n8n never
+    # needs to talk to Consul directly. Adding it would widen the reach
+    # for no functional gain.
+    - to:
+        - ipBlock:
+            cidr: 192.168.1.51/32
+      ports:
+        - protocol: TCP
+          port: 4646
+    # Groq's API, on the public internet. Cannot be pinned to an IP:
+    # api.groq.com is behind Cloudflare and its addresses rotate.
+    # Deliberately excludes RFC1918 space so this rule cannot become a
+    # general path into the rest of the lab.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Basic auth enforced at the EDGE, not inside n8n.
+#
+# Two reasons this belongs here rather than in n8n's own config:
+#  1. n8n 1.x dropped N8N_BASIC_AUTH_* entirely (Problem #115).
+#  2. n8n's replacement is an owner account created on first visit
+#     (`showSetupOnFirstLoad: true`). Until someone claims it, ANY
+#     visitor can — so the window between deploying and claiming is
+#     itself the vulnerability. Edge auth closes that window, and keeps
+#     protecting the instance afterwards.
+#
+# The htpasswd hash is generated by deploy-n8n.sh from the same
+# credentials it prints once.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: n8n-auth
+  namespace: n8n
+spec:
+  basicAuth:
+    secret: n8n-basicauth
+    realm: CloudLab n8n
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: n8n
+  namespace: n8n
+  annotations:
+    spec.ingressClassName: traefik
+    traefik.ingress.kubernetes.io/router.middlewares: n8n-n8n-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: n8n.cloudlab.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: n8n
+                port:
+                  number: 80

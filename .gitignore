@@ -1,0 +1,16 @@
+# The master handoff carries Vault unseal keys, root passwords and tokens
+# in plain text. It is never copied into this repo; this is the second
+# line of defence, not the first.
+FULL-MASTER-HANDOFF-v5.md
+
+# Key material. tls/ is deliberately never copied off kube.
+*.key
+*.pem
+tls/
+freeipa-ca.crt
+
+*.bak
+*.bak-*
+__pycache__/
+*.pyc
+.env

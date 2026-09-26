@@ -1,0 +1,17 @@
+# Normalise everything to LF in the repository. The shell scripts here run
+# on Debian VMs; a CRLF shebang line makes the kernel report
+# "bad interpreter: /usr/bin/env bash^M", which reads as a missing
+# interpreter rather than a line-ending problem.
+* text=auto eol=lf
+
+# Binaries must never be normalised - a substituted byte corrupts them.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+*.zip  binary
+*.gz   binary

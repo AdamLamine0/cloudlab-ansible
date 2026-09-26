@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudLab — your projects</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="page">
+
+  <div class="bg">
+    <img class="bg__img" src="assets/bg-aurora.png" alt="" aria-hidden="true">
+    <div class="bg__scrim"></div>
+    <div class="bg__glow"></div>
+  </div>
+
+  <nav class="rail" aria-label="Primary">
+    <img class="rail__logo" src="assets/tt-mark.png" alt="Tunisie Telecom">
+    <a class="rail__item rail__item--active" href="dashboard.html" aria-label="Overview" aria-current="page">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+    </a>
+    <a class="rail__item" href="dashboard-empty.html" aria-label="Projects">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="4" r="2.2"/><circle cx="4" cy="12" r="2.2"/><circle cx="12" cy="12" r="2.2"/><path d="M8 6.2 L4 9.8 M8 6.2 L12 9.8"/></svg>
+    </a>
+    <a class="rail__item" href="dashboard.html" aria-label="Activity">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 11 L6 6 L9 9 L14 3"/></svg>
+    </a>
+    <span class="rail__spacer"></span>
+    <span class="rail__avatar" aria-hidden="true">AB</span>
+  </nav>
+
+  <main class="app">
+
+    <header class="topbar">
+      <div>
+        <p class="kicker">Tuesday, 15 September</p>
+        <h1 class="greeting">Bonjour, Amine.</h1>
+        <p class="greeting-sub">Three projects are live. Nothing needs your attention.</p>
+      </div>
+      <div class="topbar__actions">
+        <a class="link-quiet" href="login.html">Log out</a>
+        <a class="btn btn--sm" href="dashboard-empty.html">Launch another project</a>
+      </div>
+    </header>
+
+    <section class="projects" aria-label="Deployed projects">
+
+      <article class="project">
+        <div class="project__head">
+          <span class="project__glyph" aria-hidden="true"></span>
+          <span class="status"><span class="status__dot"></span>Live</span>
+        </div>
+        <h2 class="project__name">billing-portal</h2>
+        <a class="project__url" href="https://billing.cloudlab.tn">billing.cloudlab.tn</a>
+        <p class="project__meta">Kubernetes · 3 replicas · deployed 6 days ago</p>
+      </article>
+
+      <article class="project">
+        <div class="project__head">
+          <span class="project__glyph project__glyph--warm" aria-hidden="true"></span>
+          <span class="status"><span class="status__dot"></span>Live</span>
+        </div>
+        <h2 class="project__name">atlas-api</h2>
+        <a class="project__url" href="https://atlas-api.cloudlab.tn">atlas-api.cloudlab.tn</a>
+        <p class="project__meta">Nomad · 2 allocations · deployed 2 days ago</p>
+      </article>
+
+      <article class="project">
+        <div class="project__head">
+          <span class="project__glyph project__glyph--cool" aria-hidden="true"></span>
+          <span class="status"><span class="status__dot"></span>Live</span>
+        </div>
+        <h2 class="project__name">souk-checkout</h2>
+        <a class="project__url" href="https://souk.cloudlab.tn">souk.cloudlab.tn</a>
+        <p class="project__meta">Kubernetes · 1 replica · deployed 14 hours ago</p>
+      </article>
+
+    </section>
+
+    <aside class="strip">
+      <span class="strip__glyph" aria-hidden="true"></span>
+      <div class="strip__text">
+        <p class="strip__title">Describe your next project in a sentence.</p>
+        <p class="strip__sub">CloudLab chooses Kubernetes or Nomad for you and gives it its own isolated space.</p>
+      </div>
+      <a class="strip__cta" href="dashboard-empty.html">Start →</a>
+    </aside>
+
+  </main>
+</div>
+</body>
+</html>

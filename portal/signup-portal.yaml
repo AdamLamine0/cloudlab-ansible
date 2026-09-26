@@ -1,0 +1,444 @@
+---
+# signup-portal + console — the user-facing platform apps.
+#
+# SPLIT INTO TWO DEPLOYMENTS 2026-08-28. This is Part 23 item 7's trigger
+# firing: n8n arrived and needs egress the signup half must never have.
+#
+# ONE codebase, TWO deployments, distinguished by PORTAL_ROLE. The
+# security boundary is the POD — which Secrets it mounts and where its
+# NetworkPolicy lets it reach — not the source file. Splitting the source
+# would have duplicated SHELL and the entire CSS block, which is exactly
+# the drift that made deploy-novault.sh a mistake.
+#
+#   signup-portal : / and /signup
+#                   HAS  IPA_PASSWORD, egress to FreeIPA
+#                   LACKS the n8n token and any route to n8n
+#                   => structurally cannot provision infrastructure
+#
+#   console       : /login /welcome /new-project /logout
+#                   HAS  the n8n webhook token, egress to n8n
+#                   LACKS IPA_PASSWORD and any route to FreeIPA
+#                   => structurally cannot create FreeIPA users
+#
+# Both hold DEX_CLIENT_SECRET (signup auto-logs-in after account
+# creation; console authenticates) and SESSION_KEY (one mints sessions,
+# the other validates them). That secret only permits ASKING Dex to
+# validate a username and password — it grants neither user creation nor
+# provisioning — so sharing it does not weaken the boundary above.
+#
+# Hardening unchanged from Part 16: non-root 65534, no privilege
+# escalation, all caps dropped, read-only rootfs, RuntimeDefault seccomp,
+# automountServiceAccountToken false (neither app calls the k8s API).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: signup
+  labels:
+    name: signup
+    tier: platform
+---
+# The signup-portal-code ConfigMap is NOT declared here any more.
+#
+# It now carries app.py plus three binary PNGs, and binary keys have to
+# live under `binaryData` as base64. Hand-maintaining ~270KB of base64 in
+# this file would make it undiffable and easy to corrupt, so deploy.sh
+# builds the ConfigMap with `kubectl create configmap --from-file`, which
+# sorts text from binary on its own. Both deployments mount it at /app,
+# which is where the app reads app.py AND the images from.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signup-portal
+  namespace: signup
+spec:
+  selector:
+    app: signup-portal
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: console
+  namespace: signup
+spec:
+  selector:
+    app: console
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signup-portal
+  namespace: signup
+  labels:
+    app: signup-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signup-portal
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: signup-portal
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signup-portal
+          image: python:3.12-alpine
+          imagePullPolicy: Always
+          command: ["python3", "/app/app.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORTAL_ROLE
+              value: "signup"
+            - name: IPA_HOST
+              value: "freeipa.cloudlab.internal"
+            - name: IPA_USER
+              value: "svc-portal"
+            - name: IPA_CA_CERT
+              value: "/etc/ipa-ca/freeipa-ca.crt"
+            - name: IPA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: signup-portal-ipa
+                  key: password
+            - name: DEX_ISSUER
+              value: "https://dex.dex.svc.cluster.local:5554/dex"
+            - name: DEX_CLIENT_ID
+              value: "signup-portal"
+            - name: DEX_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: signup-portal-oidc
+                  key: client_secret
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: signup-portal-session
+                  key: key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "192Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+            - name: ipa-ca
+              mountPath: /etc/ipa-ca
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: signup-portal-code
+        - name: ipa-ca
+          configMap:
+            name: signup-portal-ca
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: console
+  namespace: signup
+  labels:
+    app: console
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: console
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: console
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: console
+          image: python:3.12-alpine
+          imagePullPolicy: Always
+          command: ["python3", "/app/app.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORTAL_ROLE
+              value: "console"
+            # NOTE: no IPA_PASSWORD, no IPA_* config at all. This pod
+            # cannot create FreeIPA users even if the code asked it to.
+            - name: IPA_CA_CERT
+              value: "/etc/ipa-ca/freeipa-ca.crt"
+            - name: DEX_ISSUER
+              value: "https://dex.dex.svc.cluster.local:5554/dex"
+            - name: DEX_CLIENT_ID
+              value: "signup-portal"
+            - name: DEX_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: signup-portal-oidc
+                  key: client_secret
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: signup-portal-session
+                  key: key
+            - name: N8N_WEBHOOK_URL
+              value: "http://n8n.n8n.svc.cluster.local/webhook/new-project"
+            - name: N8N_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: console-n8n
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "192Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+            # Dex's cert is signed by the FreeIPA CA, so the console needs
+            # the CA to VERIFY Dex — it does not follow that it can reach
+            # FreeIPA itself. The NetworkPolicy below denies that.
+            - name: ipa-ca
+              mountPath: /etc/ipa-ca
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: signup-portal-code
+        - name: ipa-ca
+          configMap:
+            name: signup-portal-ca
+---
+# signup-portal: FreeIPA and Dex. NOT n8n.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signup-portal
+  namespace: signup
+spec:
+  podSelector:
+    matchLabels:
+      app: signup-portal
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # FreeIPA HTTPS — account creation.
+    - to:
+        - ipBlock:
+            cidr: 192.168.1.152/32
+      ports:
+        - protocol: TCP
+          port: 443
+    # Dex — auto-login after signup.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dex
+      ports:
+        - protocol: TCP
+          port: 5554
+---
+# console: Dex and n8n. NOT FreeIPA.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: console
+  namespace: signup
+spec:
+  podSelector:
+    matchLabels:
+      app: console
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Dex — real login.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dex
+      ports:
+        - protocol: TCP
+          port: 5554
+    # n8n — provisioning. THE egress signup-portal must never have.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: n8n
+      ports:
+        - protocol: TCP
+          port: 5678
+---
+# Path-based routing on the SINGLE existing host, so every relative link
+# (href="/login") keeps working and no new DNS record is needed.
+#
+# Traefik prioritises longer path prefixes, so the specific console paths
+# win over signup-portal's "/". That ordering is verified after deploy
+# rather than assumed — if it ever regresses, every console route would
+# silently land on signup-portal and 404.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: signup-portal
+  namespace: signup
+  annotations:
+    spec.ingressClassName: traefik
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: signup.cloudlab.internal
+      http:
+        paths:
+          - path: /login
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+          - path: /welcome
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+          - path: /new-project
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+          - path: /logout
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+          # POST /delete-project. Needs an explicit rule like every other
+          # console route: without one the `/` catch-all below sends it to
+          # the SIGNUP pod, which does not serve console routes and answers
+          # 404. A new console route always needs a rule added here.
+          - path: /delete-project
+            pathType: Prefix
+            backend:
+              service:
+                name: console
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: signup-portal
+                port:
+                  number: 80
